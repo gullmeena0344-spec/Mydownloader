@@ -5,3 +5,4 @@ requests
 aria2p
 tqdm
 ffmpeg
+ffprobe
