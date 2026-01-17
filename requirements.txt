@@ -4,5 +4,3 @@ yt-dlp
 requests
 aria2p
 tqdm
-ffmpeg
-ffprobe
