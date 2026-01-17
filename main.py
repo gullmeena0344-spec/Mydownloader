@@ -4,6 +4,7 @@ import shutil
 import asyncio
 import subprocess
 import time
+import math
 import requests
 
 from pyrogram import Client, filters
@@ -17,10 +18,13 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
 DOWNLOAD_DIR = "downloads"
+THUMB_DIR = "thumbs"
+SPLIT_SIZE = 1900 * 1024 * 1024  # ~2GB
+
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(THUMB_DIR, exist_ok=True)
 
 PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
-GOFILE_FOLDER_RE = re.compile(r"https?://gofile\.io/d/([A-Za-z0-9]+)")
 
 QUEUE = asyncio.Queue()
 BUSY = False
@@ -28,7 +32,7 @@ BUSY = False
 # ================= BOT =================
 
 app = Client(
-    "bot",
+    "video_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
@@ -45,14 +49,14 @@ def cleanup(path):
     except:
         pass
 
-def disk_ok(min_free_mb=500):
-    stat = shutil.disk_usage("/")
-    return (stat.free / (1024 * 1024)) > min_free_mb
+def disk_ok(min_mb=600):
+    total, used, free = shutil.disk_usage("/")
+    return free // (1024 * 1024) > min_mb
 
 def sizeof_fmt(num):
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
+    for u in ["B", "KB", "MB", "GB"]:
         if num < 1024:
-            return f"{num:.2f}{unit}"
+            return f"{num:.2f}{u}"
         num /= 1024
 
 async def progress(current, total, msg, start, label):
@@ -68,127 +72,140 @@ async def progress(current, total, msg, start, label):
             f"{label}\n"
             f"[{bar}] {percent:.1f}%\n"
             f"{sizeof_fmt(current)} / {sizeof_fmt(total)}\n"
-            f"Speed: {sizeof_fmt(speed)}/s"
+            f"{sizeof_fmt(speed)}/s"
         )
     except:
         pass
+
+# ================= VIDEO FIXES =================
+
+def faststart_fix(inp):
+    out = inp.replace(".mp4", "_fast.mp4")
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", inp, "-map", "0", "-c", "copy", "-movflags", "+faststart", out],
+        check=True
+    )
+    cleanup(inp)
+    return out
+
+def generate_thumb(video):
+    thumb = os.path.join(THUMB_DIR, os.path.basename(video) + ".jpg")
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", video, "-ss", "00:00:02", "-vframes", "1", thumb],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    return thumb if os.path.exists(thumb) else None
+
+def split_video(path):
+    size = os.path.getsize(path)
+    if size <= SPLIT_SIZE:
+        return [path]
+
+    parts = math.ceil(size / SPLIT_SIZE)
+    out_files = []
+
+    for i in range(parts):
+        out = path.replace(".mp4", f".part{i+1}.mp4")
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", path,
+                "-ss", str(i * 600),
+                "-t", "600",
+                "-c", "copy",
+                out
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        if os.path.exists(out):
+            out_files.append(out)
+
+    cleanup(path)
+    return out_files
 
 # ================= DOWNLOADERS =================
 
 def pixeldrain_download(url):
     fid = PIXELDRAIN_RE.search(url).group(1)
-    info = requests.get(f"https://pixeldrain.com/api/file/{fid}/info").json()
-    ext = info.get("mime_type", "").split("/")[-1] or "mp4"
-    out = os.path.join(DOWNLOAD_DIR, f"{fid}.{ext}")
-
-    with requests.get(f"https://pixeldrain.com/api/file/{fid}", stream=True) as r:
-        r.raise_for_status()
-        with open(out, "wb") as f:
-            for chunk in r.iter_content(1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-
+    out = os.path.join(DOWNLOAD_DIR, f"{fid}.mp4")
+    r = requests.get(f"https://pixeldrain.com/api/file/{fid}", stream=True)
+    with open(out, "wb") as f:
+        for c in r.iter_content(1024 * 1024):
+            f.write(c)
     return out
-
-def gofile_direct_download(url):
-    name = url.split("/")[-1].split("?")[0]
-    out = os.path.join(DOWNLOAD_DIR, name)
-
-    with requests.get(url, stream=True, timeout=30) as r:
-        r.raise_for_status()
-        with open(out, "wb") as f:
-            for chunk in r.iter_content(1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-
-    return out
-
-def gofile_folder_download(url):
-    page = requests.get(url).text
-    token_match = re.search(r'"token":"(.*?)"', page)
-    if not token_match:
-        raise Exception("GoFile token not found")
-
-    token = token_match.group(1)
-    cid = GOFILE_FOLDER_RE.search(url).group(1)
-
-    api = requests.get(
-        f"https://api.gofile.io/getContent?contentId={cid}&token={token}"
-    ).json()
-
-    for f in api["data"]["contents"].values():
-        if f["name"].lower().endswith((".mp4", ".mkv", ".webm", ".avi", ".mov")):
-            return gofile_direct_download(f["link"])
-
-    raise Exception("No video found in GoFile folder")
 
 def yt_dlp_download(url):
     out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
-    subprocess.run(
-        [
-            "yt-dlp",
-            "-f",
-            "bv*+ba/b",
-            "--merge-output-format",
-            "mp4",
-            "--no-playlist",
-            "-o",
-            out,
-            url,
-        ],
-        check=True,
-    )
+    try:
+        subprocess.run(
+            ["yt-dlp", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", out, url],
+            check=True
+        )
+    except:
+        return None
 
     for f in os.listdir(DOWNLOAD_DIR):
-        if f.lower().endswith((".mp4", ".mkv", ".webm", ".avi", ".mov")):
+        if f.endswith(".mp4"):
             return os.path.join(DOWNLOAD_DIR, f)
+    return None
 
-    raise Exception("yt-dlp produced no video")
+def aria2_download(url):
+    subprocess.run(
+        ["aria2c", "-x", "8", "-s", "8", "-d", DOWNLOAD_DIR, url],
+        check=True
+    )
+    for f in os.listdir(DOWNLOAD_DIR):
+        if f.endswith(".mp4"):
+            return os.path.join(DOWNLOAD_DIR, f)
+    return None
 
-# ================= QUEUE PROCESS =================
+# ================= PROCESS =================
 
 async def process(msg: Message):
     if not disk_ok():
-        await msg.reply("❌ Disk almost full, wait for cleanup")
+        await msg.reply("❌ Disk low, wait for cleanup")
         return
 
     status = await msg.reply("⬇️ Downloading...")
     start = time.time()
 
     try:
-        text = msg.text or ""
+        url = msg.text.strip()
 
-        if PIXELDRAIN_RE.search(text):
-            file = pixeldrain_download(text)
-
-        elif "gofile.io/download/web/" in text:
-            file = gofile_direct_download(text)
-
-        elif GOFILE_FOLDER_RE.search(text):
-            file = gofile_folder_download(text)
-
-        elif text.startswith("http"):
-            file = yt_dlp_download(text)
-
+        if PIXELDRAIN_RE.search(url):
+            video = pixeldrain_download(url)
         else:
-            await status.edit("❌ Unsupported link")
+            video = yt_dlp_download(url) or aria2_download(url)
+
+        if not video:
+            await status.edit("❌ Download failed")
             return
 
-        await status.edit("⬆️ Uploading...")
-        await msg.reply_video(
-            file,
-            supports_streaming=True,
-            progress=progress,
-            progress_args=(status, start, "Uploading"),
-        )
+        video = faststart_fix(video)
+        parts = split_video(video)
 
-        cleanup(file)
+        for part in parts:
+            thumb = generate_thumb(part)
+            await msg.reply_video(
+                part,
+                thumb=thumb,
+                supports_streaming=True,
+                progress=progress,
+                progress_args=(status, start, "Uploading")
+            )
+            cleanup(part)
+            if thumb:
+                cleanup(thumb)
+
+        await status.delete()
 
     except Exception as e:
         await status.edit(f"❌ Error: {e}")
         cleanup(DOWNLOAD_DIR)
+        cleanup(THUMB_DIR)
 
-# ================= HANDLERS =================
+# ================= HANDLER =================
 
 @app.on_message(filters.private & filters.user(ADMIN_ID))
 async def handler(_, msg: Message):
