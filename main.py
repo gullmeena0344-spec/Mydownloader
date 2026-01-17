@@ -19,7 +19,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
 DOWNLOAD_DIR = "downloads"
-MAX_SIZE = 1900 * 1024 * 1024  # 1.9GB split limit
+MAX_SIZE = 1900 * 1024 * 1024  # 1.9GB
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -78,15 +78,7 @@ def is_video(path):
     mime, _ = mimetypes.guess_type(path)
     return mime and mime.startswith("video")
 
-# ================= FIX VIDEO =================
-
-def faststart_mp4(path):
-    out = path + ".fast.mp4"
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", path, "-map", "0", "-c", "copy", "-movflags", "+faststart", out],
-        check=True
-    )
-    os.replace(out, path)
+# ================= VIDEO FIX =================
 
 def mkv_to_mp4(path):
     if not path.lower().endswith(".mkv"):
@@ -99,27 +91,57 @@ def mkv_to_mp4(path):
     cleanup(path)
     return out
 
+def faststart(path):
+    tmp = path + ".fast.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", path, "-map", "0", "-c", "copy", "-movflags", "+faststart", tmp],
+        check=True
+    )
+    os.replace(tmp, path)
+
+def generate_thumbnail(video):
+    thumb = video + ".jpg"
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-ss", "00:00:05",
+            "-i", video,
+            "-vframes", "1",
+            "-vf", "scale=320:-1",
+            thumb
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    return thumb if os.path.exists(thumb) else None
+
 def split_video(path):
     size = os.path.getsize(path)
     if size <= MAX_SIZE:
         return [path]
 
     parts = []
-    total = math.ceil(size / MAX_SIZE)
+    duration = int(
+        subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path]
+        ).decode().strip().split(".")[0]
+    )
 
-    for i in range(total):
-        out = f"{path}.part{i+1}.mp4"
+    part_len = duration / math.ceil(size / MAX_SIZE)
+
+    start = 0
+    idx = 1
+    while start < duration:
+        out = f"{path}.part{idx}.mp4"
         subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", path,
-                "-ss", str(i * 600),
-                "-t", "600",
-                "-c", "copy",
-                out
-            ],
+            ["ffmpeg", "-y", "-i", path, "-ss", str(start),
+             "-t", str(int(part_len)), "-c", "copy", out],
             check=True
         )
         parts.append(out)
+        start += part_len
+        idx += 1
 
     cleanup(path)
     return parts
@@ -139,7 +161,7 @@ def pixeldrain_download(url):
         for c in r.iter_content(1024 * 1024):
             if c:
                 f.write(c)
-    return out
+    return [out]
 
 def gofile_download(url):
     page = requests.get(url).text
@@ -147,20 +169,27 @@ def gofile_download(url):
     cid = GOFILE_RE.search(url).group(1)
 
     api = requests.get(
-        f"https://api.gofile.io/getContent?contentId={cid}&token={token}"
+        f"https://api.gofile.io/getContent?contentId={cid}&token={token}&recursive=true"
     ).json()
 
+    files = []
+
     for item in api["data"]["contents"].values():
-        if item["type"] == "file" and item["name"].lower().endswith((".mp4",".mkv",".webm",".avi")):
+        if item["type"] == "file" and item["name"].lower().endswith(
+            (".mp4",".mkv",".webm",".avi",".mov")
+        ):
             out = os.path.join(DOWNLOAD_DIR, item["name"])
             r = requests.get(item["link"], stream=True)
             with open(out, "wb") as f:
                 for c in r.iter_content(1024 * 1024):
                     if c:
                         f.write(c)
-            return out
+            files.append(out)
 
-    raise Exception("No video found")
+    if not files:
+        raise Exception("No video found in GoFile")
+
+    return files
 
 def yt_dlp_download(url):
     out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
@@ -168,8 +197,7 @@ def yt_dlp_download(url):
         ["yt-dlp", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", out, url],
         check=True
     )
-    for f in os.listdir(DOWNLOAD_DIR):
-        return os.path.join(DOWNLOAD_DIR, f)
+    return [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR)]
 
 # ================= PROCESS =================
 
@@ -181,30 +209,36 @@ async def process(msg: Message):
         text = msg.text or ""
 
         if PIXELDRAIN_RE.search(text):
-            file = pixeldrain_download(text)
+            files = pixeldrain_download(text)
         elif GOFILE_RE.search(text):
-            file = gofile_download(text)
+            files = gofile_download(text)
         else:
-            file = yt_dlp_download(text)
+            files = yt_dlp_download(text)
 
-        if not is_video(file):
-            cleanup(file)
-            await status.edit("❌ Not a video")
-            return
+        for file in files:
+            if not is_video(file):
+                cleanup(file)
+                continue
 
-        file = mkv_to_mp4(file)
-        faststart_mp4(file)
+            file = mkv_to_mp4(file)
+            faststart(file)
 
-        parts = split_video(file)
+            parts = split_video(file)
 
-        for p in parts:
-            await msg.reply_video(
-                p,
-                supports_streaming=True,
-                progress=progress,
-                progress_args=(status, start, "Uploading")
-            )
-            cleanup(p)
+            for p in parts:
+                thumb = generate_thumbnail(p)
+
+                await msg.reply_video(
+                    p,
+                    thumb=thumb,
+                    supports_streaming=True,
+                    progress=progress,
+                    progress_args=(status, start, "Uploading")
+                )
+
+                if thumb:
+                    cleanup(thumb)
+                cleanup(p)
 
         await status.delete()
 
