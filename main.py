@@ -1,6 +1,5 @@
 import os
 import re
-import time
 import shutil
 import subprocess
 import requests
@@ -14,7 +13,7 @@ API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 DOWNLOAD_DIR = "downloads"
-MAX_SIZE = 1900 * 1024 * 1024  # 1.9GB safety
+MAX_SIZE = 1900 * 1024 * 1024
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -34,131 +33,108 @@ app = Client(
 @app.on_message(filters.command("start"))
 async def start(_, m: Message):
     await m.reply_text(
-        "📥 **Video Downloader Bot**\n\n"
-        "Send any:\n"
-        "• Direct video link\n"
-        "• m3u8 / HLS link\n"
-        "• Pixeldrain URL\n\n"
-        "Streamable ✔ Thumbnail ✔ Auto cleanup ✔"
+        "📥 Send a video URL\n"
+        "✔ Streamable\n"
+        "✔ Thumbnail fixed\n"
+        "✔ No blue screen"
     )
 
-# ================= UTILITIES =================
+# ================= UTIL =================
 
 def clean():
-    if os.path.exists(DOWNLOAD_DIR):
-        shutil.rmtree(DOWNLOAD_DIR)
-        os.makedirs(DOWNLOAD_DIR)
+    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+    os.makedirs(DOWNLOAD_DIR)
 
-def progress_bar(current, total):
-    percent = current * 100 / total if total else 0
-    filled = int(percent // 10)
-    return f"[{'█'*filled}{'░'*(10-filled)}] {percent:.1f}%"
-
-async def upload_progress(current, total, msg):
-    try:
-        await msg.edit_text(
-            f"⬆ Uploading\n{progress_bar(current, total)}"
-        )
-    except:
-        pass
-
-# ================= DOWNLOAD =================
-
-def pixeldrain_download(file_id):
-    url = f"https://pixeldrain.com/api/file/{file_id}"
-    r = requests.get(url, stream=True)
-    name = r.headers.get("Content-Disposition", "video.mp4").split("filename=")[-1]
-    path = f"{DOWNLOAD_DIR}/{name}"
-
-    with open(path, "wb") as f:
-        for chunk in r.iter_content(1024 * 1024):
-            f.write(chunk)
-
-    return path
-
-def ytdlp_download(url):
-    out = f"{DOWNLOAD_DIR}/%(title)s.%(ext)s"
+def yt_download(url):
+    out = f"{DOWNLOAD_DIR}/video.%(ext)s"
     cmd = [
         "yt-dlp",
         "-f", "bv*+ba/b",
         "--merge-output-format", "mp4",
         "--no-playlist",
-        "--hls-use-mpegts",
-        "--remux-video", "mp4",
+        "--force-overwrites",
+        "--concurrent-fragments", "4",
+        "--downloader", "ffmpeg",
         "-o", out,
         url
     ]
     subprocess.run(cmd, check=True)
-    return max(
-        [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR)],
-        key=os.path.getsize
-    )
+    return f"{DOWNLOAD_DIR}/video.mp4"
 
-def fix_video(file):
-    fixed = file.replace(".mp4", "_fixed.mp4")
+def pixeldrain_download(fid):
+    r = requests.get(f"https://pixeldrain.com/api/file/{fid}", stream=True)
+    path = f"{DOWNLOAD_DIR}/video.mp4"
+    with open(path, "wb") as f:
+        for c in r.iter_content(1024 * 1024):
+            f.write(c)
+    return path
+
+def fix_mp4(input_file):
+    fixed = f"{DOWNLOAD_DIR}/fixed.mp4"
     subprocess.run(
         [
             "ffmpeg", "-y",
-            "-i", file,
-            "-map", "0",
-            "-c", "copy",
+            "-i", input_file,
+            "-map", "0:v:0",
+            "-map", "0:a?",
+            "-c:v", "copy",
+            "-c:a", "aac",
             "-movflags", "+faststart",
+            "-reset_timestamps", "1",
             fixed
         ],
         check=True
     )
-    os.remove(file)
     return fixed
 
-def generate_thumb(video):
-    thumb = video.replace(".mp4", ".jpg")
+def make_thumb(video):
+    thumb = f"{DOWNLOAD_DIR}/thumb.jpg"
     subprocess.run(
-        ["ffmpeg", "-y", "-i", video, "-ss", "00:00:01", "-vframes", "1", thumb],
+        [
+            "ffmpeg", "-y",
+            "-i", video,
+            "-vf", "thumbnail,scale=640:-1",
+            "-frames:v", "1",
+            thumb
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
-    return thumb if os.path.exists(thumb) else None
+    return thumb
 
 # ================= HANDLER =================
 
-@app.on_message(filters.text & ~filters.command(["start"]))
-async def downloader(_, m: Message):
-    url = m.text.strip()
-    status = await m.reply_text("⬇ Downloading...")
-
+@app.on_message(filters.text & ~filters.command("start"))
+async def handler(_, m: Message):
     clean()
+    url = m.text.strip()
+    msg = await m.reply("⬇ Downloading...")
 
     try:
         match = PIXELDRAIN_RE.search(url)
-        if match:
-            file = pixeldrain_download(match.group(1))
-        else:
-            file = ytdlp_download(url)
+        file = pixeldrain_download(match.group(1)) if match else yt_download(url)
 
         if os.path.getsize(file) > MAX_SIZE:
-            await status.edit_text("❌ File too large")
-            clean()
-            return
+            return await msg.edit("❌ File too large")
 
-        fixed = fix_video(file)
-        thumb = generate_thumb(fixed)
+        await msg.edit("🛠 Fixing stream...")
+        fixed = fix_mp4(file)
 
-        await status.edit_text("⬆ Uploading...")
+        thumb = make_thumb(fixed)
 
+        await msg.edit("⬆ Uploading...")
         await m.reply_video(
             fixed,
-            thumb=thumb,
             supports_streaming=True,
-            progress=upload_progress,
-            progress_args=(status,)
+            thumb=thumb
         )
 
     except Exception as e:
-        await status.edit_text(f"❌ Error:\n`{e}`")
+        await msg.edit(f"❌ Error:\n`{e}`")
 
     clean()
 
-# ================= START =================
+# ================= RUN =================
 
-print("Bot started")
+print("Bot running...")
 app.run()
