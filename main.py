@@ -13,8 +13,8 @@ GOFILE_API_TOKEN = os.getenv("GOFILE_API_TOKEN")
 DOWNLOAD_DIR = "downloads"
 SPLIT_SIZE = 1900 * 1024 * 1024
 COOKIES_FILE = "cookies.txt"
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 ALLOWED_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -31,51 +31,57 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-# ================= HELP =================
+# ================= DISK GUARD (FREE TIER SAFE) =================
 
-@app.on_message(filters.command("start"))
-async def start(_, m: Message):
-    await m.reply(
-        "📥 **Downloader Bot**\n\n"
-        "Send:\n"
-        "• Direct video link\n"
-        "• m3u8 / HLS\n"
-        "• Pixeldrain\n"
-        "• GoFile\n\n"
-        "✔ Streamable\n✔ No blue screen\n✔ Thumbnail safe"
-    )
+def disk_guard(limit_mb=3500):
+    total = 0
+    for root, _, files in os.walk(DOWNLOAD_DIR):
+        for f in files:
+            total += os.path.getsize(os.path.join(root, f))
+    if total > limit_mb * 1024 * 1024:
+        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# ================= UTIL =================
+# ================= PROGRESS + SPEED =================
 
-def clean():
-    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-    os.makedirs(DOWNLOAD_DIR)
-
-def progress_bar(current, total):
+def get_pb(current, total):
     percent = (current / total * 100) if total else 0
     done = int(percent / 10)
     return f"[{'█'*done}{'░'*(10-done)}] {percent:.1f}%"
 
-async def progress_cb(current, total, msg, tag):
-    if not hasattr(progress_cb, "last"):
-        progress_cb.last = 0
-    if time.time() - progress_cb.last < 3:
+async def progress_func(current, total, message, tag):
+    now = time.time()
+
+    if not hasattr(progress_func, "last"):
+        progress_func.last = now
+        progress_func.last_bytes = current
         return
-    progress_cb.last = time.time()
+
+    diff = now - progress_func.last
+    if diff < 4:
+        return
+
+    speed = (current - progress_func.last_bytes) / diff / 1024 / 1024
+    progress_func.last = now
+    progress_func.last_bytes = current
+
     try:
-        await msg.edit(f"**{tag}**\n{progress_bar(current, total)}")
+        await message.edit(
+            f"**{tag}**\n"
+            f"{get_pb(current, total)}\n"
+            f"`{current/1024/1024:.2f}/{total/1024/1024:.2f} MB`\n"
+            f"⚡ `{speed:.2f} MB/s`"
+        )
     except:
         pass
 
-# ================= DOWNLOADERS =================
+# ================= HELPERS =================
 
-def download_pixeldrain(fid):
-    r = requests.get(f"https://pixeldrain.com/api/file/{fid}", stream=True)
-    path = f"{DOWNLOAD_DIR}/video.mp4"
-    with open(path, "wb") as f:
-        for c in r.iter_content(1024*1024):
-            f.write(c)
-    return path
+def extract_clean_url(text):
+    m = re.search(r'(https?://[^\s\n]+)', text)
+    return m.group(1) if m else None
+
+# ================= GOFILE =================
 
 async def download_gofile(cid, status):
     headers = {
@@ -88,15 +94,19 @@ async def download_gofile(cid, status):
     for item in contents.values():
         if item["type"] != "file":
             continue
-        path = os.path.join(DOWNLOAD_DIR, item["name"])
+
+        out = os.path.join(DOWNLOAD_DIR, item["name"])
         with requests.get(item["directLink"], stream=True, headers=headers) as r:
             total = int(r.headers.get("content-length", 0))
             cur = 0
-            with open(path, "wb") as f:
+            with open(out, "wb") as f:
                 for chunk in r.iter_content(1024*1024):
                     f.write(chunk)
                     cur += len(chunk)
-                    await progress_cb(cur, total, status, "Downloading GoFile")
+                    await progress_func(cur, total, status, "Downloading")
+        disk_guard()
+
+# ================= YT-DLP =================
 
 def download_ytdlp(url):
     out = f"{DOWNLOAD_DIR}/video.%(ext)s"
@@ -104,13 +114,11 @@ def download_ytdlp(url):
     referer = f"{parsed.scheme}://{parsed.netloc}/"
     cmd = [
         "yt-dlp",
-        "-f", "bv*+ba/b",
-        "--merge-output-format", "mp4",
         "--no-playlist",
         "--cookies", COOKIES_FILE,
         "--user-agent", UA,
         "--add-header", f"Referer:{referer}",
-        "--downloader", "ffmpeg",
+        "--merge-output-format", "mp4",
         "-o", out,
         url
     ]
@@ -119,30 +127,18 @@ def download_ytdlp(url):
 
 # ================= VIDEO FIX =================
 
-def fix_and_thumb(src):
-    fixed = f"{DOWNLOAD_DIR}/fixed.mp4"
-    thumb = f"{DOWNLOAD_DIR}/thumb.jpg"
+def faststart_and_thumb(src):
+    fixed = src.replace(".mp4", "_fixed.mp4")
+    thumb = src.replace(".mp4", ".jpg")
 
     subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-i", src,
-            "-map", "0:v:0",
-            "-map", "0:a?",
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-movflags", "+faststart",
-            "-reset_timestamps", "1",
-            fixed
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+        ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
     subprocess.run(
-        ["ffmpeg", "-y", "-ss", "00:00:02", "-i", fixed, "-frames:v", "1", thumb],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+        ["ffmpeg", "-y", "-ss", "00:00:02", "-i", fixed, "-vframes", "1", thumb],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
     if os.path.exists(src):
@@ -154,12 +150,14 @@ def split_file(path):
     parts = []
     size = os.path.getsize(path)
     count = math.ceil(size / SPLIT_SIZE)
+
     with open(path, "rb") as f:
         for i in range(count):
             part = f"{path}.part{i+1}.mp4"
             with open(part, "wb") as o:
                 o.write(f.read(SPLIT_SIZE))
             parts.append(part)
+
     os.remove(path)
     return parts
 
@@ -167,46 +165,59 @@ def split_file(path):
 
 @app.on_message(filters.private & filters.text & ~filters.command("start"))
 async def handler(_, m: Message):
-    clean()
-    url = m.text.strip()
+    disk_guard()
+    url = extract_clean_url(m.text)
+    if not url:
+        return
+
     status = await m.reply("⬇ Downloading...")
 
     try:
-        if PIXELDRAIN_RE.search(url):
-            file = download_pixeldrain(PIXELDRAIN_RE.search(url).group(1))
-
-        elif GOFILE_RE.search(url):
+        if GOFILE_RE.search(url):
             await download_gofile(GOFILE_RE.search(url).group(1), status)
             files = [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR)]
 
             for f in files:
-                fixed, thumb = fix_and_thumb(f)
-                await m.reply_video(fixed, thumb=thumb, supports_streaming=True)
-            clean()
+                fixed, thumb = faststart_and_thumb(f)
+                await m.reply_video(
+                    fixed,
+                    thumb=thumb,
+                    supports_streaming=True,
+                    progress=progress_func,
+                    progress_args=(status, "Uploading")
+                )
+                disk_guard()
             return
 
         else:
             file = download_ytdlp(url)
 
-        fixed, thumb = fix_and_thumb(file)
+        fixed, thumb = faststart_and_thumb(file)
 
         if os.path.getsize(fixed) > SPLIT_SIZE:
-            parts = split_file(fixed)
-            for p in parts:
-                await m.reply_video(p, supports_streaming=True)
+            for part in split_file(fixed):
+                await m.reply_video(
+                    part,
+                    supports_streaming=True,
+                    progress=progress_func,
+                    progress_args=(status, "Uploading")
+                )
+                disk_guard()
         else:
             await m.reply_video(
                 fixed,
+                thumb=thumb,
                 supports_streaming=True,
-                thumb=thumb if thumb else None
+                progress=progress_func,
+                progress_args=(status, "Uploading")
             )
 
     except Exception as e:
         await status.edit(f"❌ Error:\n`{e}`")
 
-    clean()
+    disk_guard()
 
-# ================= RUN =================
+# ================= START =================
 
 print("Bot running...")
 app.run()
