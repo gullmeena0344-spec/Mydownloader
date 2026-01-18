@@ -1,197 +1,167 @@
-import os, re, shutil, subprocess, time, math, asyncio
+import os
+import re
+import math
+import shutil
+import asyncio
+import subprocess
+import time
+import requests
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from urllib.parse import urlparse
 
-# ================= CONFIG =================
+# ================== CONFIG ==================
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 DOWNLOAD_DIR = "downloads"
-COOKIES_FILE = "cookies.txt"
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-MAX_SIZE = 1900 * 1024 * 1024
+SPLIT_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
 
-VIDEO_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
+PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
+GOFILE_RE = re.compile(r"https?://gofile\.io/d/([A-Za-z0-9]+)")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# ================= BOT =================
-
 app = Client(
-    "downloader-bot",
+    "gofile_pixeldrain_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
 
-queue_lock = asyncio.Lock()
+# ================== HELPERS ==================
 
-# ================= UTILITIES =================
+async def progress(current, total, message: Message, start, action):
+    now = time.time()
+    if now - start < 1:
+        return
+    percent = current * 100 / total
+    speed = current / (now - start)
+    eta = (total - current) / speed if speed > 0 else 0
 
-def cleanup():
-    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-def extract_url(text):
-    m = re.search(r"(https?://[^\s]+)", text)
-    return m.group(1) if m else None
-
-def normalize_embed(url):
-    return url.replace("/embed/", "/") if "/embed/" in url else url
-
-# ================= VIDEO CHECK =================
-
-def is_real_video(path):
-    if not path.lower().endswith(VIDEO_EXT):
-        return False
-    if not os.path.exists(path) or os.path.getsize(path) < 500 * 1024:
-        return False
+    bar = "█" * int(percent / 10) + "░" * (10 - int(percent / 10))
+    text = (
+        f"{action}\n"
+        f"[{bar}] {percent:.1f}%\n"
+        f"{current // (1024*1024)} / {total // (1024*1024)} MB\n"
+        f"Speed: {speed / (1024*1024):.2f} MB/s\n"
+        f"ETA: {int(eta)}s"
+    )
     try:
-        subprocess.check_output(
-            ["ffprobe", "-v", "error", "-select_streams", "v",
-             "-show_entries", "stream=index", "-of", "csv=p=0", path],
-            stderr=subprocess.DEVNULL
-        )
-        return True
-    except:
-        return False
-
-# ================= PROGRESS =================
-
-async def progress_func(cur, total, msg, tag, start):
-    speed = cur / max(1, time.time() - start)
-    try:
-        await msg.edit(
-            f"**{tag}**\n"
-            f"`{cur/1024/1024:.2f} / {total/1024/1024:.2f} MB`\n"
-            f"⚡ `{speed/1024/1024:.2f} MB/s`"
-        )
+        await message.edit(text)
     except:
         pass
 
-# ================= YT-DLP =================
 
-def download_ytdlp(url):
-    url = normalize_embed(url)
-    out = f"{DOWNLOAD_DIR}/%(title)s.%(ext)s"
+def clean_dir(path):
+    if os.path.exists(path):
+        shutil.rmtree(path, ignore_errors=True)
 
-    base_cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--user-agent", UA,
-        "--merge-output-format", "mp4",
-        "-o", out,
-        url
-    ]
 
-    if os.path.exists(COOKIES_FILE):
-        try:
-            subprocess.run(
-                ["yt-dlp", "--cookies", COOKIES_FILE, *base_cmd[1:]],
-                check=True
-            )
-            return
-        except subprocess.CalledProcessError:
-            pass
-
-    subprocess.run(base_cmd, check=True)
-
-# ================= VIDEO FIX =================
-
-def fix_and_thumb(src):
-    fixed = src.rsplit(".", 1)[0] + "_fixed.mp4"
-    thumb = src.rsplit(".", 1)[0] + ".jpg"
-
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", fixed, "-ss", "00:00:20", "-vframes", "1", thumb],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-
-    if not os.path.exists(fixed):
-        return None, None
-
-    os.remove(src)
-    return fixed, thumb if os.path.exists(thumb) else None
-
-# ================= SPLIT =================
-
-def split_video(path):
+def split_file(filepath):
     parts = []
-    size = os.path.getsize(path)
-    count = math.ceil(size / MAX_SIZE)
+    size = os.path.getsize(filepath)
+    if size <= SPLIT_SIZE:
+        return [filepath]
 
-    with open(path, "rb") as f:
-        for i in range(count):
-            part = f"{path}.part{i+1}.mp4"
-            with open(part, "wb") as o:
-                o.write(f.read(MAX_SIZE))
-            parts.append(part)
+    base = os.path.splitext(filepath)[0]
+    with open(filepath, "rb") as f:
+        part = 1
+        while True:
+            chunk = f.read(SPLIT_SIZE)
+            if not chunk:
+                break
+            part_path = f"{base}.part{part}.mp4"
+            with open(part_path, "wb") as p:
+                p.write(chunk)
+            parts.append(part_path)
+            part += 1
 
-    os.remove(path)
+    os.remove(filepath)
     return parts
 
-# ================= HANDLER =================
+
+def make_thumbnail(video, thumb):
+    subprocess.run([
+        "ffmpeg", "-y", "-i", video,
+        "-ss", "00:00:01", "-vframes", "1", thumb
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ================== DOWNLOADERS ==================
+
+def download_pixeldrain(url, out_dir):
+    file_id = PIXELDRAIN_RE.search(url).group(1)
+    info = requests.get(f"https://pixeldrain.com/api/file/{file_id}/info").json()
+    name = info["name"]
+
+    path = os.path.join(out_dir, name)
+    with requests.get(f"https://pixeldrain.com/api/file/{file_id}", stream=True) as r:
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(1024 * 1024):
+                f.write(chunk)
+    return path
+
+
+def download_gofile(url, out_dir):
+    from run import GoFile  # uses your remembered run.py
+
+    go = GoFile()
+    go.update_token()
+    go.update_wt()
+    files = go.get_files(dir=out_dir, url=url)
+    return [f.path for f in files]
+
+
+# ================== BOT ==================
 
 @app.on_message(filters.private & filters.text)
-async def handler(_, m: Message):
-    url = extract_url(m.text)
-    if not url:
-        return
+async def handle(client, message: Message):
+    url = message.text.strip()
 
-    async with queue_lock:
-        status = await m.reply("⏬ **Queued & Downloading...**")
-        start = time.time()
+    if not (PIXELDRAIN_RE.match(url) or GOFILE_RE.match(url)):
+        return await message.reply("❌ Send a valid GoFile or Pixeldrain URL")
 
-        cleanup()
+    workdir = os.path.join(DOWNLOAD_DIR, str(message.id))
+    os.makedirs(workdir, exist_ok=True)
 
-        try:
-            download_ytdlp(url)
-            found = False
+    status = await message.reply("📥 Downloading...")
+    start = time.time()
 
-            for f in os.listdir(DOWNLOAD_DIR):
-                path = os.path.join(DOWNLOAD_DIR, f)
+    try:
+        paths = []
+        if PIXELDRAIN_RE.match(url):
+            paths.append(download_pixeldrain(url, workdir))
+        else:
+            paths.extend(download_gofile(url, workdir))
 
-                if not is_real_video(path):
-                    continue
+        media = []
+        for path in paths:
+            parts = split_file(path)
+            for part in parts:
+                thumb = part + ".jpg"
+                make_thumbnail(part, thumb)
 
-                fixed, thumb = fix_and_thumb(path)
-                if not fixed:
-                    continue
-
-                files = (
-                    split_video(fixed)
-                    if os.path.getsize(fixed) > MAX_SIZE
-                    else [fixed]
+                media.append(
+                    await client.send_video(
+                        chat_id=message.chat.id,
+                        video=part,
+                        thumb=thumb if os.path.exists(thumb) else None,
+                        progress=progress,
+                        progress_args=(status, start, "📤 Uploading")
+                    )
                 )
 
-                found = True
-                for i, file in enumerate(files, 1):
-                    await status.edit(f"⏫ **Uploading part {i}/{len(files)}**")
-                    await m.reply_video(
-                        video=file,
-                        thumb=thumb if thumb and os.path.exists(thumb) else None,
-                        supports_streaming=True,
-                        progress=progress_func,
-                        progress_args=(status, "Uploading", start)
-                    )
-                    os.remove(file)
+        await status.delete()
 
-            if not found:
-                await status.edit("❌ No valid video found")
+    except Exception as e:
+        await status.edit(f"❌ Error: {e}")
 
-        except Exception as e:
-            await status.edit(f"❌ `{e}`")
+    finally:
+        clean_dir(workdir)
 
-        cleanup()
 
-# ================= START =================
-
-print("Bot started")
 app.run()
