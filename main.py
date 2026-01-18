@@ -1,5 +1,4 @@
-import os, re, math, shutil, subprocess, requests, time
-from urllib.parse import urlparse
+import os, re, shutil, subprocess, time, math, asyncio
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
@@ -8,19 +7,15 @@ from pyrogram.types import Message
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GOFILE_API_TOKEN = os.getenv("GOFILE_API_TOKEN")
 
 DOWNLOAD_DIR = "downloads"
-SPLIT_SIZE = 1900 * 1024 * 1024
 COOKIES_FILE = "cookies.txt"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+MAX_SIZE = 1900 * 1024 * 1024
 
-ALLOWED_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
+VIDEO_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
+
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
-GOFILE_RE = re.compile(r"https?://gofile\.io/d/([A-Za-z0-9]+)")
-EMBED_RE = re.compile(r"/embed/")
 
 # ================= BOT =================
 
@@ -31,114 +26,172 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-# ================= PROGRESS =================
+queue_lock = asyncio.Lock()
 
-def get_pb(cur, total):
-    percent = (cur / total) * 100 if total else 0
-    done = int(percent / 10)
-    return f"[{'█'*done}{'░'*(10-done)}] {percent:.1f}%"
-
-async def progress_func(cur, total, msg, tag, start):
-    now = time.time()
-    speed = cur / (now - start + 1)
-    try:
-        await msg.edit(
-            f"**{tag}**\n"
-            f"{get_pb(cur,total)}\n"
-            f"`{cur/1024/1024:.2f}/{total/1024/1024:.2f} MB`\n"
-            f"⚡ `{speed/1024/1024:.2f} MB/s`"
-        )
-    except:
-        pass
-
-# ================= HELPERS =================
-
-def clean_url(text):
-    m = re.search(r"(https?://[^\s]+)", text)
-    return m.group(1) if m else None
-
-def normalize_embed(url):
-    if EMBED_RE.search(url):
-        return url.replace("/embed/", "/")
-    return url
+# ================= UTILITIES =================
 
 def cleanup():
     shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+def extract_url(text):
+    m = re.search(r"(https?://[^\s]+)", text)
+    return m.group(1) if m else None
+
+def normalize_embed(url):
+    return url.replace("/embed/", "/") if "/embed/" in url else url
+
+# ================= VIDEO CHECK =================
+
+def is_real_video(path):
+    if not path.lower().endswith(VIDEO_EXT):
+        return False
+    if not os.path.exists(path) or os.path.getsize(path) < 500 * 1024:
+        return False
+    try:
+        subprocess.check_output(
+            ["ffprobe", "-v", "error", "-select_streams", "v",
+             "-show_entries", "stream=index", "-of", "csv=p=0", path],
+            stderr=subprocess.DEVNULL
+        )
+        return True
+    except:
+        return False
+
+# ================= PROGRESS =================
+
+async def progress_func(cur, total, msg, tag, start):
+    speed = cur / max(1, time.time() - start)
+    try:
+        await msg.edit(
+            f"**{tag}**\n"
+            f"`{cur/1024/1024:.2f} / {total/1024/1024:.2f} MB`\n"
+            f"⚡ `{speed/1024/1024:.2f} MB/s`"
+        )
+    except:
+        pass
+
+# ================= YT-DLP =================
+
+def download_ytdlp(url):
+    url = normalize_embed(url)
+    out = f"{DOWNLOAD_DIR}/%(title)s.%(ext)s"
+
+    base_cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--user-agent", UA,
+        "--merge-output-format", "mp4",
+        "-o", out,
+        url
+    ]
+
+    if os.path.exists(COOKIES_FILE):
+        try:
+            subprocess.run(
+                ["yt-dlp", "--cookies", COOKIES_FILE, *base_cmd[1:]],
+                check=True
+            )
+            return
+        except subprocess.CalledProcessError:
+            pass
+
+    subprocess.run(base_cmd, check=True)
+
 # ================= VIDEO FIX =================
 
-def faststart_thumb(src):
-    base = src.rsplit(".",1)[0]
-    fixed = base + "_fixed.mp4"
-    thumb = base + ".jpg"
+def fix_and_thumb(src):
+    fixed = src.rsplit(".", 1)[0] + "_fixed.mp4"
+    thumb = src.rsplit(".", 1)[0] + ".jpg"
 
-    subprocess.run([
-        "ffmpeg","-y","-i",src,
-        "-movflags","+faststart","-c","copy",fixed
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
 
-    subprocess.run([
-        "ffmpeg","-y","-i",fixed,
-        "-ss","00:00:20","-vframes","1",thumb
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", fixed, "-ss", "00:00:20", "-vframes", "1", thumb],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    if not os.path.exists(fixed):
+        return None, None
 
     os.remove(src)
     return fixed, thumb if os.path.exists(thumb) else None
 
-# ================= YT-DLP =================
+# ================= SPLIT =================
 
-def ytdlp_download(url):
-    url = normalize_embed(url)
-    out = f"{DOWNLOAD_DIR}/%(title)s.%(ext)s"
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--cookies", COOKIES_FILE,
-        "--user-agent", UA,
-        "--merge-output-format","mp4",
-        "-o", out,
-        url
-    ]
-    subprocess.run(cmd, check=True)
+def split_video(path):
+    parts = []
+    size = os.path.getsize(path)
+    count = math.ceil(size / MAX_SIZE)
+
+    with open(path, "rb") as f:
+        for i in range(count):
+            part = f"{path}.part{i+1}.mp4"
+            with open(part, "wb") as o:
+                o.write(f.read(MAX_SIZE))
+            parts.append(part)
+
+    os.remove(path)
+    return parts
 
 # ================= HANDLER =================
 
 @app.on_message(filters.private & filters.text)
 async def handler(_, m: Message):
-    url = clean_url(m.text)
+    url = extract_url(m.text)
     if not url:
         return
 
-    status = await m.reply("⏬ **Downloading...**")
-    start = time.time()
+    async with queue_lock:
+        status = await m.reply("⏬ **Queued & Downloading...**")
+        start = time.time()
 
-    try:
-        if PIXELDRAIN_RE.search(url) or GOFILE_RE.search(url):
-            ytdlp_download(url)
-        else:
-            ytdlp_download(url)
+        cleanup()
 
-        for f in os.listdir(DOWNLOAD_DIR):
-            path = os.path.join(DOWNLOAD_DIR, f)
-            if not path.lower().endswith(ALLOWED_EXT):
-                continue
+        try:
+            download_ytdlp(url)
+            found = False
 
-            fixed, thumb = faststart_thumb(path)
-            size = os.path.getsize(fixed)
+            for f in os.listdir(DOWNLOAD_DIR):
+                path = os.path.join(DOWNLOAD_DIR, f)
 
-            await status.edit("⏫ **Uploading...**")
-            await m.reply_video(
-                fixed,
-                thumb=thumb,
-                supports_streaming=True,
-                progress=progress_func,
-                progress_args=("Uploading", start)
-            )
+                if not is_real_video(path):
+                    continue
 
-    except Exception as e:
-        await status.edit(f"❌ `{e}`")
+                fixed, thumb = fix_and_thumb(path)
+                if not fixed:
+                    continue
 
-    cleanup()
+                files = (
+                    split_video(fixed)
+                    if os.path.getsize(fixed) > MAX_SIZE
+                    else [fixed]
+                )
 
+                found = True
+                for i, file in enumerate(files, 1):
+                    await status.edit(f"⏫ **Uploading part {i}/{len(files)}**")
+                    await m.reply_video(
+                        video=file,
+                        thumb=thumb if thumb and os.path.exists(thumb) else None,
+                        supports_streaming=True,
+                        progress=progress_func,
+                        progress_args=(status, "Uploading", start)
+                    )
+                    os.remove(file)
+
+            if not found:
+                await status.edit("❌ No valid video found")
+
+        except Exception as e:
+            await status.edit(f"❌ `{e}`")
+
+        cleanup()
+
+# ================= START =================
+
+print("Bot started")
 app.run()
