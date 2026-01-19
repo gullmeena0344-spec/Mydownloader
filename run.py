@@ -1,58 +1,141 @@
-import os
-import math
+import argparse
+import fnmatch
+import hashlib
 import logging
-import shutil
-import requests
+import math
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
-from tqdm import tqdm
+
+import requests
 from pathvalidate import sanitize_filename
+import shutil
+from tqdm import tqdm
+
 
 logging.basicConfig(
     level=logging.INFO,
-    format="[%(asctime)s][%(levelname)-8s]: %(message)s",
+    format="[%(asctime)s][%(funcName)20s()][%(levelname)-8s]: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger("GoFile")
+
 
 class File:
     def __init__(self, link: str, dest: str):
         self.link = link
         self.dest = dest
 
-class GoFile:
-    def __init__(self):
-        self.token = os.getenv("GOFILE_TOKEN")
-        self.lock = Lock()
+    def __str__(self):
+        return f"{self.dest} ({self.link})"
 
-    def _get_size(self, link):
+
+class Downloader:
+    def __init__(self, token):
+        self.token = token
+        self.progress_lock = Lock()
+        self.progress_bar = None
+
+    def _get_total_size(self, link):
         r = requests.head(link, headers={"Cookie": f"accountToken={self.token}"})
         r.raise_for_status()
-        return int(r.headers.get("Content-Length", 0))
+        return int(r.headers["Content-Length"]), r.headers.get("Accept-Ranges", "none") == "bytes"
 
-    def execute(self, dir, url, num_threads=1):
-        os.makedirs(dir, exist_ok=True)
+    def _download_range(self, link, start, end, temp_file, i):
+        existing_size = os.path.getsize(temp_file) if os.path.exists(temp_file) else 0
+        range_start = start + existing_size
+        if range_start > end:
+            return i
+        headers = {
+            "Cookie": f"accountToken={self.token}",
+            "Range": f"bytes={range_start}-{end}"
+        }
+        with requests.get(link, headers=headers, stream=True) as r:
+            r.raise_for_status()
+            with open(temp_file, "ab") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        with self.progress_lock:
+                            self.progress_bar.update(len(chunk))
+        return i
 
-        api = requests.get(f"https://api.gofile.io/getContent?contentId={url.split('/')[-1]}").json()
-        files = api["data"]["contents"].values()
+    def _merge_temp_files(self, temp_dir, dest, num_threads):
+        with open(dest, "wb") as outfile:
+            for i in range(num_threads):
+                temp_file = os.path.join(temp_dir, f"part_{i}")
+                with open(temp_file, "rb") as f:
+                    outfile.write(f.read())
+                os.remove(temp_file)
+        shutil.rmtree(temp_dir)
 
-        for f in files:
-            if f["type"] != "file":
-                continue
+    def download(self, file: File, num_threads=4):
+        link = file.link
+        dest = file.dest
+        temp_dir = dest + "_parts"
+        try:
+            total_size, is_support_range = self._get_total_size(link)
 
-            name = sanitize_filename(f["name"])
-            link = f["link"]
-            dest = os.path.join(dir, name)
+            if os.path.exists(dest):
+                if os.path.getsize(dest) == total_size:
+                    return
+            
+            if num_threads == 1 or not is_support_range:
+                temp_file = dest + ".part"
+                downloaded_bytes = os.path.getsize(temp_file) if os.path.exists(temp_file) else 0
 
-            total = self._get_size(link)
-            bar = tqdm(total=total, unit="B", unit_scale=True, desc=name)
+                display_name = (
+                    os.path.basename(dest)[:10] + "....." + os.path.basename(dest)[-10:]
+                    if len(os.path.basename(dest)) > 25
+                    else os.path.basename(dest).rjust(25)
+                )
 
-            headers = {"Cookie": f"accountToken={self.token}"}
+                self.progress_bar = tqdm(
+                    total=total_size,
+                    initial=downloaded_bytes,
+                    unit='B',
+                    unit_scale=True,
+                    desc=f'Downloading {display_name}'
+                )
 
-            with requests.get(link, headers=headers, stream=True) as r:
-                r.raise_for_status()
-                with open(dest, "wb") as out:
-                    for chunk in r.iter_content(8192):
-                        if chunk:
-                            out.write(chunk)
-                            bar.update(len(chunk))
+                headers = {
+                    "Cookie": f"accountToken={self.token}",
+                    "Range": f"bytes={downloaded_bytes}-"
+                }
 
-            bar.close()
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with requests.get(link, headers=headers, stream=True) as r:
+                    r.raise_for_status()
+                    with open(temp_file, "ab") as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                                self.progress_bar.update(len(chunk))
+
+                self.progress_bar.close()
+                os.rename(temp_file, dest)
+
+            else:
+                os.path.exists(dest + ".part") and os.remove(dest + ".part")
+
+                check_file = os.path.join(temp_dir, "num_threads")
+                if os.path.exists(temp_dir):
+                    prev_num_threads = None
+                    if os.path.exists(check_file):
+                        with open(check_file) as f:
+                            prev_num_threads = int(f.read())
+                    if prev_num_threads is None or prev_num_threads != num_threads:
+                        shutil.rmtree(temp_dir)
+
+                if not os.path.exists(temp_dir):
+                    os.makedirs(temp_dir, exist_ok=True)
+                    with open(check_file, "w") as f:
+                        f.write(str(num_threads))
+
+                part_size = math.ceil(total_size / num_threads)
+                downloaded_bytes = sum(
+                    os.path.getsize(os.path.join(temp_dir, f"part_{i}"))
+                    for i in range(num_threads)
+           
