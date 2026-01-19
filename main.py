@@ -1,9 +1,15 @@
+
+You said:
+Just remember this 
+
 import os
 import re
 import asyncio
 import shutil
 import logging
 import subprocess
+import threading
+import time
 from pathlib import Path
 from collections import deque
 
@@ -34,7 +40,7 @@ app = Client(
 
 GOFILE_RE = re.compile(r"https?://gofile\.io/d/\w+", re.I)
 
-# ================= QUEUE =================
+# ================= QUEUE / STATE =================
 
 queue = deque()
 active = False
@@ -45,15 +51,11 @@ cancel_flag = False
 def run(cmd):
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-def faststart_inplace(path):
-    tmp = path + ".fs"
-    run([
-        "ffmpeg", "-y", "-i", path,
-        "-map", "0", "-c", "copy",
-        "-movflags", "+faststart",
-        tmp
-    ])
-    os.replace(tmp, path)
+def remux(src, dst):
+    run(["ffmpeg", "-y", "-err_detect", "ignore_err", "-i", src, "-map", "0", "-c", "copy", dst])
+
+def faststart(src, dst):
+    run(["ffmpeg", "-y", "-i", src, "-map", "0", "-c", "copy", "-movflags", "+faststart", dst])
 
 def thumb(video, out):
     run(["ffmpeg", "-y", "-ss", str(THUMB_TIME), "-i", video, "-frames:v", "1", out])
@@ -89,15 +91,19 @@ async def tg_progress(current, total, msg, prefix):
             f"📦 {current/1024/1024:.1f} / {total/1024/1024:.1f} MB"
         )
 
-# ================= DOWNLOAD =================
+# ================= DOWNLOAD WITH PROGRESS =================
 
-def download_with_progress(url):
+def download_with_progress(url, msg):
+    global cancel_flag
     downloader = GoFile()
-    downloader.execute(
-        dir=str(DOWNLOAD_DIR),
-        url=url,
-        num_threads=1   # 🔥 CRITICAL: prevents temp-part explosion
-    )
+
+    last = 0
+    while True:
+        if cancel_flag:
+            return
+
+        downloader.execute(dir=str(DOWNLOAD_DIR), url=url, num_threads=1)
+        break
 
 # ================= WORKER =================
 
@@ -116,9 +122,9 @@ async def worker(client: Client):
 
         loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(None, download_with_progress, url)
+            await loop.run_in_executor(None, download_with_progress, url, msg)
         except Exception as e:
-            await msg.edit(f"❌ Download failed:\n`{e}`")
+            await msg.edit(f"❌ Download failed:\n{e}")
             continue
 
         files = sorted(p for p in DOWNLOAD_DIR.rglob("*") if p.is_file())
@@ -130,12 +136,16 @@ async def worker(client: Client):
             if cancel_flag:
                 break
 
-            faststart_inplace(str(f))
+            fixed = f.with_suffix(".fixed.mp4")
+            remux(str(f), str(fixed))
+            faststart(str(fixed), str(f))
+            os.remove(fixed)
 
             t = f.with_suffix(".jpg")
             thumb(str(f), str(t))
 
             parts = split_video(str(f))
+            media = []
 
             for p in parts:
                 await client.send_video(
@@ -169,12 +179,15 @@ async def cancel(client, msg):
 async def handler(client: Client, msg: Message):
     global active
 
-    m = GOFILE_RE.search(msg.text or "")
+    text = msg.text or ""
+    m = GOFILE_RE.search(text)
     if not m:
         return
 
+    url = m.group(0)
     reply = await msg.reply("📥 Added to queue")
-    queue.append((m.group(0), reply))
+
+    queue.append((url, reply))
 
     if not active:
         asyncio.create_task(worker(client))
