@@ -1,134 +1,99 @@
 import os
+import re
 import asyncio
 import shutil
 import logging
+import subprocess
 from pathlib import Path
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-from run import GoFile  # IMPORTANT: run.py MUST be lowercase
-
-# ================= CONFIG =================
+from run import GoFile
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
 DOWNLOAD_DIR = Path("output")
+MAX_TG_SIZE = 2 * 1024 * 1024 * 1024
+THUMB_TIME = 20
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-# ================= USERBOT =================
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("BOT")
 
 app = Client(
-    name="gofile-userbot",
+    "gofile-userbot",
     api_id=API_ID,
     api_hash=API_HASH,
     session_string=SESSION_STRING,
 )
 
-# ================= HELPERS =================
+def cmd(cmd):
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-async def progress(current, total, message: Message, start):
-    percent = (current / total) * 100
-    elapsed = asyncio.get_event_loop().time() - start
-    speed = current / elapsed if elapsed > 0 else 0
-    eta = (total - current) / speed if speed > 0 else 0
+def faststart(src, dst):
+    cmd(["ffmpeg", "-y", "-i", src, "-map", "0", "-c", "copy", "-movflags", "+faststart", dst])
 
-    text = (
-        f"📥 Uploading video...\n"
-        f"{percent:.2f}%\n"
-        f"{current / 1024 / 1024:.2f} MB / {total / 1024 / 1024:.2f} MB\n"
-        f"Speed: {speed / 1024 / 1024:.2f} MB/s\n"
-        f"ETA: {int(eta)} sec"
-    )
+def remux(src, dst):
+    cmd(["ffmpeg", "-y", "-err_detect", "ignore_err", "-i", src, "-map", "0", "-c", "copy", dst])
 
-    try:
-        await message.edit(text)
-    except:
-        pass
+def thumb(video, out):
+    cmd(["ffmpeg", "-y", "-ss", str(THUMB_TIME), "-i", video, "-frames:v", "1", out])
 
+def split(path):
+    if os.path.getsize(path) <= MAX_TG_SIZE:
+        return [path]
 
-def cleanup(path: Path):
-    try:
-        if path.exists():
-            if path.is_file():
-                path.unlink()
-            else:
-                shutil.rmtree(path)
-    except Exception as e:
-        logger.warning(f"Cleanup failed: {e}")
+    base = Path(path)
+    pattern = base.with_name(f"{base.stem}_part%03d.mp4")
+    cmd(["ffmpeg", "-i", path, "-map", "0", "-c", "copy", "-f", "segment", "-segment_time", "3600", str(pattern)])
+    os.remove(path)
+    return sorted(str(p) for p in base.parent.glob(f"{base.stem}_part*.mp4"))
 
+GOFILE_RE = re.compile(r"https?://gofile\.io/d/\w+", re.I)
 
-# ================= COMMAND =================
-
-@app.on_message(filters.me & filters.command("gofile"))
-async def gofile_handler(client: Client, message: Message):
-    if len(message.command) < 2:
-        await message.reply("❌ Usage:\n`/gofile <gofile_link>`")
+@app.on_message(filters.text)
+async def handler(client, message: Message):
+    if not message.text:
+        return
+    m = GOFILE_RE.search(message.text)
+    if not m:
         return
 
-    url = message.command[1]
-    status = await message.reply("🔍 Fetching files...")
+    url = m.group(0)
+    status = await message.reply("⬇️ Downloading...")
+    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+    DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-    # Ensure clean start
-    cleanup(DOWNLOAD_DIR)
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    GoFile().execute(dir=str(DOWNLOAD_DIR), url=url, num_threads=1)
 
-    # Download via run.py logic
-    try:
-        GoFile().execute(
-            dir=str(DOWNLOAD_DIR),
-            url=url,
-            num_threads=1,  # SAFE for justrunmy.app
-        )
-    except Exception as e:
-        await status.edit(f"❌ Download failed:\n`{e}`")
-        cleanup(DOWNLOAD_DIR)
-        return
-
-    # Collect downloaded files
-    files = sorted([p for p in DOWNLOAD_DIR.rglob("*") if p.is_file()])
-
+    files = [p for p in DOWNLOAD_DIR.rglob("*") if p.is_file()]
     if not files:
-        await status.edit("❌ No files found.")
-        cleanup(DOWNLOAD_DIR)
-        return
+        return await status.edit("❌ No files found")
 
-    await status.edit(f"📦 {len(files)} file(s) found.\nStarting upload...")
+    for f in files:
+        fixed = f.with_suffix(".fixed.mp4")
+        remux(str(f), str(fixed))
+        faststart(str(fixed), str(f))
+        os.remove(fixed)
 
-    # Upload ONE BY ONE
-    for idx, file in enumerate(files, start=1):
-        upload_msg = await message.reply(
-            f"📤 Uploading ({idx}/{len(files)}):\n`{file.name}`"
-        )
+        thumb_path = f.with_suffix(".jpg")
+        thumb(str(f), str(thumb_path))
 
-        start_time = asyncio.get_event_loop().time()
-
-        try:
+        parts = split(str(f))
+        for p in parts:
             await client.send_video(
-                chat_id="me",
-                video=str(file),
-                supports_streaming=True,
-                progress=progress,
-                progress_args=(upload_msg, start_time),
+                "me",
+                video=p,
+                thumb=str(thumb_path),
+                supports_streaming=True
             )
-        except Exception as e:
-            await upload_msg.edit(f"❌ Upload failed:\n`{e}`")
-            cleanup(file)
-            continue
+            os.remove(p)
 
-        await upload_msg.delete()
-        cleanup(file)
+        os.remove(thumb_path)
 
-    cleanup(DOWNLOAD_DIR)
-    await status.edit("✅ Done. All videos sent to **Saved Messages**.")
-
-# ================= START =================
+    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+    await status.edit("✅ Done")
 
 app.run()
