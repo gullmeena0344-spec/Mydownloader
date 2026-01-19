@@ -1,126 +1,161 @@
 import os
-import sys
 import asyncio
-import math
+import subprocess
+import mimetypes
 import shutil
+import time
+
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from run import GoFile
 
-print(">>> main.py started", flush=True)
+# ================= CONFIG =================
 
-# ---------- ENV HANDLER (FIX) ---------- #
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+SESSION_STRING = os.getenv("SESSION_STRING")
 
-def env(name, cast=str):
-    value = os.getenv(name)
-    if not value:
-        print(f"❌ Missing environment variable: {name}", file=sys.stderr, flush=True)
-        sys.exit(1)
-    try:
-        return cast(value)
-    except Exception:
-        print(f"❌ Invalid value for environment variable: {name}", file=sys.stderr, flush=True)
-        sys.exit(1)
+BASE_DIR = os.getcwd()
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 
-API_ID = env("API_ID", int)
-API_HASH = env("API_HASH")
-SESSION_STRING = env("SESSION_STRING")
-
-# ---------- CONFIG ---------- #
-
-DOWNLOAD_DIR = "output"
-MAX_SPLIT = 2 * 1024 * 1024 * 1024  # 2GB
+# ================= CLIENT =================
 
 app = Client(
-    name="gofile-userbot",
+    "userbot",
     api_id=API_ID,
     api_hash=API_HASH,
     session_string=SESSION_STRING,
 )
 
-# ---------- HELPERS ---------- #
+# ================= UTILS =================
 
 def clean(path):
-    try:
-        if os.path.isfile(path):
+    if path and os.path.exists(path):
+        try:
             os.remove(path)
-        elif os.path.isdir(path):
-            shutil.rmtree(path)
-    except Exception:
+        except:
+            pass
+
+
+def is_video(path):
+    mime, _ = mimetypes.guess_type(path)
+    return mime and mime.startswith("video")
+
+
+def faststart(src):
+    fixed = src + ".fast.mp4"
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", src,
+        "-map", "0",
+        "-c", "copy",
+        "-movflags", "+faststart",
+        fixed
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return fixed if os.path.exists(fixed) else src
+
+
+def make_thumb(src):
+    thumb = src + ".jpg"
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", src,
+        "-ss", "00:00:01",
+        "-vframes", "1",
+        thumb
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return thumb if os.path.exists(thumb) else None
+
+
+async def progress(current, total, msg, start, label):
+    if total == 0:
+        return
+    percent = current * 100 / total
+    elapsed = time.time() - start
+    speed = current / elapsed if elapsed > 0 else 0
+    text = (
+        f"{label}\n"
+        f"{percent:.1f}%\n"
+        f"{current/1024/1024:.2f} MB / {total/1024/1024:.2f} MB\n"
+        f"Speed: {speed/1024/1024:.2f} MB/s"
+    )
+    try:
+        await msg.edit(text)
+    except:
         pass
 
 
-async def progress(current, total, message, start, label):
-    percent = current * 100 / total
-    speed = current / max(1, asyncio.get_event_loop().time() - start)
-    eta = (total - current) / speed if speed > 0 else 0
-    await message.edit_text(
-        f"{label}\n"
-        f"{percent:.2f}% | {current/1024/1024:.2f}MB / {total/1024/1024:.2f}MB\n"
-        f"Speed: {speed/1024/1024:.2f} MB/s | ETA: {eta:.1f}s"
+# ================= DOWNLOAD HANDLER =================
+
+async def process_files(msg: Message, url: str):
+    status = await msg.reply("⬇️ Starting download...")
+    start = time.time()
+
+    # Run run.py
+    proc = await asyncio.create_subprocess_exec(
+        "python", "run.py", url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
     )
+    await proc.communicate()
+
+    if not os.path.exists(OUTPUT_DIR):
+        return await status.edit("❌ No files downloaded")
+
+    files = []
+    for root, _, filenames in os.walk(OUTPUT_DIR):
+        for f in filenames:
+            files.append(os.path.join(root, f))
+
+    if not files:
+        return await status.edit("❌ Empty folder")
+
+    await status.edit(f"📦 {len(files)} files found\nUploading one by one...")
+
+    # ================= ONE BY ONE =================
+
+    for idx, file in enumerate(sorted(files), start=1):
+        start = time.time()
+        await status.edit(f"📤 Uploading {idx}/{len(files)}")
+
+        if is_video(file):
+            fixed = faststart(file)
+            thumb = make_thumb(fixed)
+
+            await app.send_video(
+                chat_id="me",
+                video=fixed,
+                thumb=thumb,
+                supports_streaming=True,
+                progress=progress,
+                progress_args=(status, start, "📤 Uploading video"),
+            )
+
+            clean(fixed)
+            clean(thumb)
+
+        else:
+            await app.send_document(
+                chat_id="me",
+                document=file,
+                progress=progress,
+                progress_args=(status, start, "📤 Uploading file"),
+            )
+
+        clean(file)
+
+    shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
+    await status.edit("✅ All files uploaded & cleaned")
 
 
-def split_file(path):
-    size = os.path.getsize(path)
-    if size <= MAX_SPLIT:
-        return [path]
+# ================= COMMAND =================
 
-    parts = []
-    with open(path, "rb") as f:
-        i = 1
-        while True:
-            chunk = f.read(MAX_SPLIT)
-            if not chunk:
-                break
-            part = f"{path}.part{i}"
-            with open(part, "wb") as p:
-                p.write(chunk)
-            parts.append(part)
-            i += 1
-    return parts
+@app.on_message(filters.me & filters.regex(r"https?://"))
+async def downloader(_, msg: Message):
+    await process_files(msg, msg.text.strip())
 
-# ---------- HANDLER ---------- #
 
-@app.on_message(filters.me & filters.regex(r"https://gofile.io/d/"))
-async def gofile_handler(_, message: Message):
-    url = message.text.strip()
-    status = await message.reply_text("📥 Downloading...")
+# ================= START =================
 
-    try:
-        GoFile().execute(
-            dir=DOWNLOAD_DIR,
-            url=url,
-            num_threads=4
-        )
-
-        for root, _, files in os.walk(DOWNLOAD_DIR):
-            for file in files:
-                full = os.path.join(root, file)
-                parts = split_file(full)
-
-                for part in parts:
-                    start = asyncio.get_event_loop().time()
-                    await app.send_document(
-                        chat_id="me",  # Saved Messages
-                        document=part,
-                        progress=progress,
-                        progress_args=(status, start, "📤 Uploading"),
-                        thumb=None
-                    )
-                    clean(part)
-
-                clean(full)
-
-        await status.edit_text("✅ Done")
-
-    except Exception as e:
-        await status.edit_text(f"❌ Error: {e}")
-
-    finally:
-        clean(DOWNLOAD_DIR)
-
-# ---------- START ---------- #
-
-print(">>> userbot starting", flush=True)
 app.run()
