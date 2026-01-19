@@ -1,4 +1,5 @@
 import os
+import sys
 import asyncio
 import math
 import shutil
@@ -6,21 +7,38 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 from run import GoFile
 
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-SESSION = os.getenv("SESSION_STRING")
+print(">>> main.py started", flush=True)
+
+# ---------- ENV HANDLER (FIX) ---------- #
+
+def env(name, cast=str):
+    value = os.getenv(name)
+    if not value:
+        print(f"❌ Missing environment variable: {name}", file=sys.stderr, flush=True)
+        sys.exit(1)
+    try:
+        return cast(value)
+    except Exception:
+        print(f"❌ Invalid value for environment variable: {name}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+API_ID = env("API_ID", int)
+API_HASH = env("API_HASH")
+SESSION_STRING = env("SESSION_STRING")
+
+# ---------- CONFIG ---------- #
 
 DOWNLOAD_DIR = "output"
 MAX_SPLIT = 2 * 1024 * 1024 * 1024  # 2GB
 
 app = Client(
-    "gofile-userbot",
+    name="gofile-userbot",
     api_id=API_ID,
     api_hash=API_HASH,
-    session_string=SESSION,
+    session_string=SESSION_STRING,
 )
 
-# ---------------- UTILS ---------------- #
+# ---------- HELPERS ---------- #
 
 def clean(path):
     try:
@@ -32,15 +50,14 @@ def clean(path):
         pass
 
 
-async def progress(current, total, msg, start, label):
+async def progress(current, total, message, start, label):
     percent = current * 100 / total
-    speed = current / (asyncio.get_event_loop().time() - start + 1)
+    speed = current / max(1, asyncio.get_event_loop().time() - start)
     eta = (total - current) / speed if speed > 0 else 0
-    await msg.edit_text(
+    await message.edit_text(
         f"{label}\n"
-        f"{percent:.2f}% | "
-        f"{current / 1024 / 1024:.2f}MB / {total / 1024 / 1024:.2f}MB\n"
-        f"Speed: {speed / 1024 / 1024:.2f} MB/s | ETA: {eta:.1f}s"
+        f"{percent:.2f}% | {current/1024/1024:.2f}MB / {total/1024/1024:.2f}MB\n"
+        f"Speed: {speed/1024/1024:.2f} MB/s | ETA: {eta:.1f}s"
     )
 
 
@@ -51,24 +68,24 @@ def split_file(path):
 
     parts = []
     with open(path, "rb") as f:
-        i = 0
+        i = 1
         while True:
             chunk = f.read(MAX_SPLIT)
             if not chunk:
                 break
-            part = f"{path}.part{i+1}"
+            part = f"{path}.part{i}"
             with open(part, "wb") as p:
                 p.write(chunk)
             parts.append(part)
             i += 1
     return parts
 
-# ---------------- HANDLER ---------------- #
+# ---------- HANDLER ---------- #
 
 @app.on_message(filters.me & filters.regex(r"https://gofile.io/d/"))
-async def gofile_handler(_, msg: Message):
-    url = msg.text.strip()
-    status = await msg.reply_text("📥 Downloading...")
+async def gofile_handler(_, message: Message):
+    url = message.text.strip()
+    status = await message.reply_text("📥 Downloading...")
 
     try:
         GoFile().execute(
@@ -82,16 +99,16 @@ async def gofile_handler(_, msg: Message):
                 full = os.path.join(root, file)
                 parts = split_file(full)
 
-                for p in parts:
+                for part in parts:
                     start = asyncio.get_event_loop().time()
                     await app.send_document(
-                        chat_id=msg.chat.id,
-                        document=p,
+                        chat_id="me",  # Saved Messages
+                        document=part,
                         progress=progress,
                         progress_args=(status, start, "📤 Uploading"),
                         thumb=None
                     )
-                    clean(p)
+                    clean(part)
 
                 clean(full)
 
@@ -103,6 +120,7 @@ async def gofile_handler(_, msg: Message):
     finally:
         clean(DOWNLOAD_DIR)
 
-# ---------------- START ---------------- #
+# ---------- START ---------- #
 
+print(">>> userbot starting", flush=True)
 app.run()
