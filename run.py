@@ -138,4 +138,189 @@ class Downloader:
                 downloaded_bytes = sum(
                     os.path.getsize(os.path.join(temp_dir, f"part_{i}"))
                     for i in range(num_threads)
-           
+                    if os.path.exists(os.path.join(temp_dir, f"part_{i}"))
+                )
+
+                display_name = (
+                    os.path.basename(dest)[:10] + "....." + os.path.basename(dest)[-10:]
+                    if len(os.path.basename(dest)) > 25
+                    else os.path.basename(dest).rjust(25)
+                )
+
+                self.progress_bar = tqdm(
+                    total=total_size,
+                    initial=downloaded_bytes,
+                    unit='B',
+                    unit_scale=True,
+                    desc=f'Downloading {display_name}'
+                )
+
+                with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                    futures = []
+                    for i in range(num_threads):
+                        start = i * part_size
+                        end = min(start + part_size - 1, total_size - 1)
+                        temp_file = os.path.join(temp_dir, f"part_{i}")
+                        futures.append(
+                            executor.submit(self._download_range, link, start, end, temp_file, i)
+                        )
+                    for future in as_completed(futures):
+                        future.result()
+
+                self.progress_bar.close()
+                self._merge_temp_files(temp_dir, dest, num_threads)
+
+        except Exception as e:
+            if self.progress_bar:
+                self.progress_bar.close()
+            logger.error(f"failed to download ({e}): {dest} ({link})")
+
+
+class GoFileMeta(type):
+    _instances = {}
+
+    def __call__(cls, *args, **kwargs):
+        if cls not in cls._instances:
+            instance = super().__call__(*args, **kwargs)
+            cls._instances[cls] = instance
+        return cls._instances[cls]
+
+
+class GoFile(metaclass=GoFileMeta):
+    def __init__(self) -> None:
+        self.token = ""
+        self.wt = ""
+        self.lock = Lock()
+
+    def update_token(self) -> None:
+        if self.token == "":
+            data = requests.post("https://api.gofile.io/accounts").json()
+            if data["status"] == "ok":
+                self.token = data["data"]["token"]
+                logger.info(f"updated token: {self.token}")
+            else:
+                raise Exception("cannot get token")
+
+    def update_wt(self) -> None:
+        if self.wt == "":
+            alljs = requests.get("https://gofile.io/dist/js/config.js").text
+            if 'appdata.wt = "' in alljs:
+                self.wt = alljs.split('appdata.wt = "')[1].split('"')[0]
+                logger.info(f"updated wt: {self.wt}")
+            else:
+                raise Exception("cannot get wt")
+
+    def execute(
+        self,
+        dir: str,
+        content_id: str = None,
+        url: str = None,
+        password: str = None,
+        proxy: str = None,
+        num_threads: int = 1,
+        includes: list[str] = None,
+        excludes: list[str] = None
+    ) -> None:
+
+        if proxy:
+            os.environ['HTTP_PROXY'] = proxy
+            os.environ['HTTPS_PROXY'] = proxy
+        else:
+            os.environ.pop('HTTP_PROXY', None)
+            os.environ.pop('HTTPS_PROXY', None)
+
+        files = self.get_files(dir, content_id, url, password, includes, excludes)
+        for file in files:
+            Downloader(token=self.token).download(file, num_threads=num_threads)
+
+    def is_included(self, filename: str, includes: list[str]) -> bool:
+        return True if not includes else any(fnmatch.fnmatch(filename, p) for p in includes)
+
+    def is_excluded(self, filename: str, excludes: list[str]) -> bool:
+        return False if not excludes else any(fnmatch.fnmatch(filename, p) for p in excludes)
+
+    def get_files(
+        self,
+        dir: str,
+        content_id: str = None,
+        url: str = None,
+        password: str = None,
+        includes: list[str] = None,
+        excludes: list[str] = None
+    ) -> list[File]:
+
+        includes = includes or []
+        excludes = excludes or []
+        files = []
+
+        if content_id:
+            self.update_token()
+            self.update_wt()
+
+            hash_password = hashlib.sha256(password.encode()).hexdigest() if password else ""
+            data = requests.get(
+                f"https://api.gofile.io/contents/{content_id}?cache=true&password={hash_password}",
+                headers={
+                    "Authorization": "Bearer " + self.token,
+                    "X-Website-Token": self.wt,
+                },
+            ).json()
+
+            if data["status"] == "ok":
+                if data["data"].get("passwordStatus", "passwordOk") == "passwordOk":
+                    if data["data"]["type"] == "folder":
+                        dirname = sanitize_filename(data["data"]["name"])
+                        dir = os.path.join(dir, dirname)
+
+                        for cid, child in data["data"]["children"].items():
+                            if child["type"] == "folder":
+                                files.extend(
+                                    self.get_files(dir, cid, password, includes, excludes)
+                                )
+                            else:
+                                name = child["name"]
+                                if self.is_included(name, includes) and not self.is_excluded(name, excludes):
+                                    files.append(File(child["link"], os.path.join(dir, sanitize_filename(name))))
+                    else:
+                        name = data["data"]["name"]
+                        if self.is_included(name, includes) and not self.is_excluded(name, excludes):
+                            files.append(File(data["data"]["link"], os.path.join(dir, sanitize_filename(name))))
+                else:
+                    logger.error("invalid password")
+
+        elif url and url.startswith("https://gofile.io/d/"):
+            files = self.get_files(dir, url.split("/")[-1], password, includes, excludes)
+        else:
+            logger.error("invalid parameters")
+
+        return files
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("url", nargs='?', default=None)
+    group.add_argument("-f", type=str, dest="file")
+    parser.add_argument("-t", type=int, dest="num_threads")
+    parser.add_argument("-d", type=str, dest="dir")
+    parser.add_argument("-p", type=str, dest="password")
+    parser.add_argument("-x", type=str, dest="proxy")
+    parser.add_argument("-i", action="append", dest="includes")
+    parser.add_argument("-e", action="append", dest="excludes")
+    args = parser.parse_args()
+
+    num_threads = args.num_threads or 1
+    dir = args.dir or "./output"
+
+    if args.file:
+        with open(args.file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    GoFile().execute(dir, url=line, password=args.password,
+                                     proxy=args.proxy, num_threads=num_threads,
+                                     includes=args.includes, excludes=args.excludes)
+    else:
+        GoFile().execute(dir, url=args.url, password=args.password,
+                         proxy=args.proxy, num_threads=num_threads,
+                         includes=args.includes, excludes=args.excludes)
