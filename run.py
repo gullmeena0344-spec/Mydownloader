@@ -1,181 +1,187 @@
-#!/usr/bin/env python3
-import os
-import sys
-import time
-import json
-import math
-import queue
-import shutil
+import argparse
+import fnmatch
+import hashlib
 import logging
-import threading
-from dataclasses import dataclass
-from typing import List, Tuple
+import math
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 import requests
+from pathvalidate import sanitize_filename
+import shutil
 from tqdm import tqdm
 
-# ================= CONFIG =================
-
-GOFILE_API = "https://api.gofile.io"
-CHUNK_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
-USER_AGENT = "Mozilla/5.0 (Downloader)"
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="[%(asctime)s][%(funcName)20s()][%(levelname)-8s]: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+    ],
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("GoFile")
 
-# ================= DATA =================
 
-@dataclass
 class File:
-    name: str
-    link: str
-    size: int
-    dest: str
+    def __init__(self, link: str, dest: str):
+        self.link = link
+        self.dest = dest
 
-# ================= GOFILE =================
+    def __str__(self):
+        return f"{self.dest} ({self.link})"
 
-class GoFile:
-    def __init__(self):
-        self.token = None
-
-    def update_token(self):
-        r = requests.get(f"{GOFILE_API}/accounts/getAccountId")
-        r.raise_for_status()
-        self.token = r.json()["data"]["token"]
-        return self.token
-
-    def get_content(self, url: str):
-        content_id = url.rstrip("/").split("/")[-1]
-        r = requests.get(
-            f"{GOFILE_API}/contents/{content_id}",
-            params={"token": self.token}
-        )
-        r.raise_for_status()
-        return r.json()["data"]
-
-    def get_files(self, url: str, output="downloads") -> List[File]:
-        data = self.get_content(url)
-        files = []
-
-        def walk(node, base):
-            for item in node.values():
-                if item["type"] == "file":
-                    dest = os.path.join(output, item["name"])
-                    files.append(
-                        File(
-                            name=item["name"],
-                            link=item["link"],
-                            size=int(item["size"]),
-                            dest=dest
-                        )
-                    )
-                elif item["type"] == "folder":
-                    walk(item["children"], base)
-
-        walk(data["children"], "")
-        return files
-
-# ================= DOWNLOADER =================
 
 class Downloader:
-    def __init__(self, token: str):
+    def __init__(self, token):
         self.token = token
+        self.progress_lock = Lock()
+        self.progress_bar = None
 
-    def _get_total_size(self, link: str) -> Tuple[int, bool]:
-        r = requests.head(
-            link,
-            headers={"Cookie": f"accountToken={self.token}"},
-            allow_redirects=True
-        )
-        size = int(r.headers.get("Content-Length", 0))
-        support_range = "bytes" in r.headers.get("Accept-Ranges", "").lower()
-        return size, support_range
+    def _get_total_size(self, link):
+        r = requests.head(link, headers={"Cookie": f"accountToken={self.token}"})
+        r.raise_for_status()
+        return int(r.headers["Content-Length"]), r.headers.get("Accept-Ranges", "none") == "bytes"
 
-    # -------- OLD FULL DOWNLOAD (UNCHANGED) --------
-    def download(self, file: File):
-        os.makedirs(os.path.dirname(file.dest), exist_ok=True)
+    def _download_range(self, link, start, end, temp_file, i):
+        existing_size = os.path.getsize(temp_file) if os.path.exists(temp_file) else 0
+        range_start = start + existing_size
+        if range_start > end:
+            return i
 
-        headers = {"Cookie": f"accountToken={self.token}"}
-        with requests.get(file.link, headers=headers, stream=True) as r:
+        headers = {
+            "Cookie": f"accountToken={self.token}",
+            "Range": f"bytes={range_start}-{end}"
+        }
+
+        with requests.get(link, headers=headers, stream=True) as r:
             r.raise_for_status()
-            with open(file.dest, "wb") as f, tqdm(
-                total=file.size,
-                unit="B",
-                unit_scale=True,
-                desc=file.name
-            ) as bar:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
+            with open(temp_file, "ab") as f:
+                for chunk in r.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
-                        bar.update(len(chunk))
-        return file.dest
+                        with self.progress_lock:
+                            if self.progress_bar:
+                                self.progress_bar.update(len(chunk))
+        return i
 
-    # -------- NEW CHUNKED RANGE DOWNLOAD --------
-    def download_in_chunks(self, file: File, chunk_size=CHUNK_SIZE):
-        """
-        Generator: downloads file in ranged chunks.
-        NEVER creates full file on disk.
-        """
+    def _merge_temp_files(self, temp_dir, dest, num_threads):
+        with open(dest, "wb") as outfile:
+            for i in range(num_threads):
+                temp_file = os.path.join(temp_dir, f"part_{i}")
+                with open(temp_file, "rb") as f:
+                    outfile.write(f.read())
+                os.remove(temp_file)
+        shutil.rmtree(temp_dir)
 
-        total_size, ranged = self._get_total_size(file.link)
-        if not ranged:
-            raise Exception("Server does not support ranged downloads")
+    def download(self, file: File, num_threads=4):
+        link = file.link
+        dest = file.dest
+        temp_dir = dest + "_parts"
 
-        downloaded = 0
-        part = 1
+        try:
+            total_size, is_support_range = self._get_total_size(link)
 
-        os.makedirs(os.path.dirname(file.dest), exist_ok=True)
+            if os.path.exists(dest) and os.path.getsize(dest) == total_size:
+                return
 
-        while downloaded < total_size:
-            start = downloaded
-            end = min(start + chunk_size - 1, total_size - 1)
+            # ================= SINGLE THREAD =================
 
-            part_path = f"{file.dest}.part{part}"
+            if num_threads == 1 or not is_support_range:
+                temp_file = dest + ".part"
+                downloaded_bytes = os.path.getsize(temp_file) if os.path.exists(temp_file) else 0
 
-            headers = {
-                "Cookie": f"accountToken={self.token}",
-                "Range": f"bytes={start}-{end}",
-                "User-Agent": USER_AGENT
-            }
+                display_name = (
+                    os.path.basename(dest)[:10] + "....." + os.path.basename(dest)[-10:]
+                    if len(os.path.basename(dest)) > 25
+                    else os.path.basename(dest).rjust(25)
+                )
 
-            logger.info(
-                f"Chunk {part}: {start // (1024**2)}MB → {end // (1024**2)}MB"
-            )
+                self.progress_bar = tqdm(
+                    total=total_size,
+                    initial=downloaded_bytes,
+                    unit='B',
+                    unit_scale=True,
+                    desc=f'Downloading {display_name}'
+                )
 
-            with requests.get(file.link, headers=headers, stream=True) as r:
-                r.raise_for_status()
-                with open(part_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
+                headers = {
+                    "Cookie": f"accountToken={self.token}",
+                    "Range": f"bytes={downloaded_bytes}-"
+                }
 
-            yield part_path  # upload this → then delete
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
 
-            downloaded += (end - start + 1)
-            part += 1
+                with requests.get(link, headers=headers, stream=True) as r:
+                    r.raise_for_status()
+                    with open(temp_file, "ab") as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                                self.progress_bar.update(len(chunk))
 
-# ================= CLI =================
+                self.progress_bar.close()
+                os.rename(temp_file, dest)
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python run.py <gofile_url>")
-        sys.exit(1)
+            # ================= MULTI THREAD (PATCHED) =================
 
-    url = sys.argv[1]
+            else:
+                if os.path.exists(dest + ".part"):
+                    os.remove(dest + ".part")
 
-    gf = GoFile()
-    gf.update_token()
+                check_file = os.path.join(temp_dir, "num_threads")
+                if os.path.exists(temp_dir):
+                    prev_num_threads = None
+                    if os.path.exists(check_file):
+                        with open(check_file) as f:
+                            prev_num_threads = int(f.read())
+                    if prev_num_threads != num_threads:
+                        shutil.rmtree(temp_dir)
 
-    files = gf.get_files(url)
+                if not os.path.exists(temp_dir):
+                    os.makedirs(temp_dir, exist_ok=True)
+                    with open(check_file, "w") as f:
+                        f.write(str(num_threads))
 
-    dl = Downloader(gf.token)
+                part_size = math.ceil(total_size / num_threads)
+                downloaded_bytes = sum(
+                    os.path.getsize(os.path.join(temp_dir, f"part_{i}"))
+                    for i in range(num_threads)
+                    if os.path.exists(os.path.join(temp_dir, f"part_{i}"))
+                )
 
-    for f in files:
-        logger.info(f"Downloading: {f.name}")
-        dl.download(f)
+                self.progress_bar = tqdm(
+                    total=total_size,
+                    initial=downloaded_bytes,
+                    unit='B',
+                    unit_scale=True,
+                    desc=f'Downloading {os.path.basename(dest)[:25]}'
+                )
 
-if __name__ == "__main__":
-    main()
+                with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                    futures = []
+                    for i in range(num_threads):
+                        start = part_size * i
+                        end = min(start + part_size - 1, total_size - 1)
+                        temp_file = os.path.join(temp_dir, f"part_{i}")
+
+                        futures.append(
+                            executor.submit(
+                                self._download_range,
+                                link,
+                                start,
+                                end,
+                                temp_file,
+                                i
+                            )
+                        )
+
+                    for _ in as_completed(futures):
+                        pass
+
+                self.progress_bar.close()
+                self._merge_temp_files(temp_dir, dest, num_threads)
+
+        except Exception as e:
+            logger.error(f"Download failed: {e}")
+            raise
