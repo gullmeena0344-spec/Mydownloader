@@ -2,14 +2,15 @@ import os
 import re
 import asyncio
 import shutil
+import logging
 import subprocess
 from pathlib import Path
 from collections import deque
 
 from pyrogram import Client, filters
-from pyrogram.types import Message, InputMediaVideo
+from pyrogram.types import Message
 
-from run import GoFile, Downloader
+from run import GoFile
 
 # ================= CONFIG =================
 
@@ -21,13 +22,8 @@ DOWNLOAD_DIR = Path("output")
 MAX_TG_SIZE = 2 * 1024 * 1024 * 1024
 THUMB_TIME = 20
 
-GOFILE_RE = re.compile(r"https?://gofile\.io/d/\w+", re.I)
-
-queue = deque()
-active = False
-cancel_flag = False
-
-# ================= APP =================
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("GOFILE-USERBOT")
 
 app = Client(
     "gofile-userbot",
@@ -36,128 +32,138 @@ app = Client(
     session_string=SESSION_STRING,
 )
 
+GOFILE_RE = re.compile(r"https?://gofile\.io/d/\w+", re.I)
+
+# ================= QUEUE =================
+
+queue = deque()
+active = False
+cancel_flag = False
+
 # ================= FFMPEG =================
 
 def run(cmd):
-    subprocess.run(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False
-    )
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-def remux(src, dst):
-    run(["ffmpeg", "-y", "-err_detect", "ignore_err", "-i", src, "-map", "0", "-c", "copy", dst])
-
-def faststart(src, dst):
-    run(["ffmpeg", "-y", "-i", src, "-map", "0", "-c", "copy", "-movflags", "+faststart", dst])
+def faststart_inplace(path):
+    tmp = path + ".fs"
+    run([
+        "ffmpeg", "-y", "-i", path,
+        "-map", "0", "-c", "copy",
+        "-movflags", "+faststart",
+        tmp
+    ])
+    os.replace(tmp, path)
 
 def thumb(video, out):
     run(["ffmpeg", "-y", "-ss", str(THUMB_TIME), "-i", video, "-frames:v", "1", out])
 
-# ================= ALBUM =================
+def split_video(path):
+    if os.path.getsize(path) <= MAX_TG_SIZE:
+        return [path]
 
-async def send_album(client, videos, thumbs):
-    media = []
-    for v, t in zip(videos, thumbs):
-        media.append(
-            InputMediaVideo(
-                media=v,
-                thumb=t,
-                supports_streaming=True
-            )
+    base = Path(path)
+    pattern = base.with_name(f"{base.stem}_part%03d.mp4")
+
+    run([
+        "ffmpeg", "-y", "-i", path,
+        "-map", "0", "-c", "copy",
+        "-f", "segment",
+        "-segment_time", "3600",
+        str(pattern)
+    ])
+
+    os.remove(path)
+    return sorted(str(p) for p in base.parent.glob(f"{base.stem}_part*.mp4"))
+
+# ================= PROGRESS =================
+
+async def tg_progress(current, total, msg, prefix):
+    if cancel_flag:
+        raise asyncio.CancelledError
+    if total:
+        pct = current * 100 / total
+        await msg.edit(
+            f"{prefix}\n"
+            f"📊 {pct:.1f}%\n"
+            f"📦 {current/1024/1024:.1f} / {total/1024/1024:.1f} MB"
         )
-    await client.send_media_group("me", media)
+
+# ================= DOWNLOAD =================
+
+def download_with_progress(url):
+    downloader = GoFile()
+    downloader.execute(
+        dir=str(DOWNLOAD_DIR),
+        url=url,
+        num_threads=1   # 🔥 CRITICAL: prevents temp-part explosion
+    )
 
 # ================= WORKER =================
 
 async def worker(client: Client):
     global active, cancel_flag
-    active = True
-    loop = asyncio.get_running_loop()
 
     while queue:
-        url, status = queue.popleft()
+        url, msg = queue.popleft()
+        active = True
         cancel_flag = False
 
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-        await status.edit("⬇️ Fetching files...")
+        await msg.edit("⬇️ Downloading...")
 
-        gf = GoFile()
-        gf.update_token()
-
-        files = await loop.run_in_executor(
-            None, gf.get_files, url, str(DOWNLOAD_DIR)
-        )
-
-        if not files:
-            await status.edit("❌ No files found")
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, download_with_progress, url)
+        except Exception as e:
+            await msg.edit(f"❌ Download failed:\n`{e}`")
             continue
 
-        dl = Downloader(gf.token)
+        files = sorted(p for p in DOWNLOAD_DIR.rglob("*") if p.is_file())
+        if not files:
+            await msg.edit("❌ No files found")
+            continue
 
         for f in files:
             if cancel_flag:
                 break
 
-            await status.edit(f"⬇️ Downloading `{f.name}`")
+            faststart_inplace(str(f))
 
-            parts = await loop.run_in_executor(
-                None, lambda: list(dl.download_in_chunks(f))
-            )
+            t = f.with_suffix(".jpg")
+            thumb(str(f), str(t))
 
-            album_videos = []
-            album_thumbs = []
+            parts = split_video(str(f))
 
-            for part in parts:
-                if cancel_flag:
-                    break
+            for p in parts:
+                await client.send_video(
+                    "me",
+                    video=p,
+                    thumb=str(t),
+                    supports_streaming=True,
+                    progress=tg_progress,
+                    progress_args=(msg, "⬆️ Uploading"),
+                )
+                os.remove(p)
 
-                if os.path.getsize(part) > MAX_TG_SIZE:
-                    os.remove(part)
-                    continue
-
-                fixed = part + ".fixed.mp4"
-                remux(part, fixed)
-                faststart(fixed, part)
-                os.remove(fixed)
-
-                t = part + ".jpg"
-                thumb(part, t)
-
-                album_videos.append(part)
-                album_thumbs.append(t)
-
-                if len(album_videos) == 10:
-                    await send_album(client, album_videos, album_thumbs)
-                    for v, th in zip(album_videos, album_thumbs):
-                        os.remove(v)
-                        os.remove(th)
-                    album_videos.clear()
-                    album_thumbs.clear()
-
-            if album_videos:
-                await send_album(client, album_videos, album_thumbs)
-                for v, th in zip(album_videos, album_thumbs):
-                    os.remove(v)
-                    os.remove(th)
+            os.remove(t)
 
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-        await status.edit("✅ Done")
+        await msg.edit("✅ Done")
 
     active = False
 
 # ================= COMMANDS =================
 
 @app.on_message(filters.command("cancel"))
-async def cancel(_, msg):
+async def cancel(client, msg):
     global cancel_flag
     cancel_flag = True
     queue.clear()
     shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-    await msg.reply("🛑 Cancelled")
+    await msg.reply("🛑 Cancelled & cleaned")
 
 @app.on_message(filters.text)
 async def handler(client: Client, msg: Message):
