@@ -2,15 +2,14 @@ import os
 import re
 import asyncio
 import shutil
-import logging
 import subprocess
 from pathlib import Path
 from collections import deque
 
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, InputMediaVideo
 
-from run import GoFile, Downloader, File
+from run import GoFile, Downloader
 
 # ================= CONFIG =================
 
@@ -22,8 +21,13 @@ DOWNLOAD_DIR = Path("output")
 MAX_TG_SIZE = 2 * 1024 * 1024 * 1024
 THUMB_TIME = 20
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("GOFILE-USERBOT")
+GOFILE_RE = re.compile(r"https?://gofile\.io/d/\w+", re.I)
+
+queue = deque()
+active = False
+cancel_flag = False
+
+# ================= APP =================
 
 app = Client(
     "gofile-userbot",
@@ -32,16 +36,15 @@ app = Client(
     session_string=SESSION_STRING,
 )
 
-GOFILE_RE = re.compile(r"https?://gofile\.io/d/\w+", re.I)
-
-queue = deque()
-active = False
-cancel_flag = False
-
 # ================= FFMPEG =================
 
 def run(cmd):
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    subprocess.run(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False
+    )
 
 def remux(src, dst):
     run(["ffmpeg", "-y", "-err_detect", "ignore_err", "-i", src, "-map", "0", "-c", "copy", dst])
@@ -52,38 +55,45 @@ def faststart(src, dst):
 def thumb(video, out):
     run(["ffmpeg", "-y", "-ss", str(THUMB_TIME), "-i", video, "-frames:v", "1", out])
 
-# ================= PROGRESS =================
+# ================= ALBUM =================
 
-async def tg_progress(current, total, msg, prefix):
-    if cancel_flag:
-        raise asyncio.CancelledError
-    if total:
-        await msg.edit(
-            f"{prefix}\n"
-            f"{current/1024/1024:.1f} / {total/1024/1024:.1f} MB"
+async def send_album(client, videos, thumbs):
+    media = []
+    for v, t in zip(videos, thumbs):
+        media.append(
+            InputMediaVideo(
+                media=v,
+                thumb=t,
+                supports_streaming=True
+            )
         )
+    await client.send_media_group("me", media)
 
 # ================= WORKER =================
 
 async def worker(client: Client):
     global active, cancel_flag
     active = True
+    loop = asyncio.get_running_loop()
 
     while queue:
-        url, msg = queue.popleft()
+        url, status = queue.popleft()
         cancel_flag = False
 
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-        await msg.edit("⬇️ Fetching files...")
+        await status.edit("⬇️ Fetching files...")
 
         gf = GoFile()
         gf.update_token()
-        files = gf.get_files(url, output=str(DOWNLOAD_DIR))
+
+        files = await loop.run_in_executor(
+            None, gf.get_files, url, str(DOWNLOAD_DIR)
+        )
 
         if not files:
-            await msg.edit("❌ No files found")
+            await status.edit("❌ No files found")
             continue
 
         dl = Downloader(gf.token)
@@ -92,19 +102,22 @@ async def worker(client: Client):
             if cancel_flag:
                 break
 
-            await msg.edit(f"⬇️ Downloading `{f.name}`")
+            await status.edit(f"⬇️ Downloading `{f.name}`")
 
-            parts = list(dl.download_in_chunks(f))
-            total_parts = len(parts)
+            parts = await loop.run_in_executor(
+                None, lambda: list(dl.download_in_chunks(f))
+            )
 
-            for idx, part in enumerate(parts, start=1):
+            album_videos = []
+            album_thumbs = []
+
+            for part in parts:
                 if cancel_flag:
                     break
 
-                await msg.edit(
-                    f"⬇️ Downloading `{f.name}`\n"
-                    f"📦 Chunk {idx} / {total_parts}"
-                )
+                if os.path.getsize(part) > MAX_TG_SIZE:
+                    os.remove(part)
+                    continue
 
                 fixed = part + ".fixed.mp4"
                 remux(part, fixed)
@@ -114,27 +127,32 @@ async def worker(client: Client):
                 t = part + ".jpg"
                 thumb(part, t)
 
-                await client.send_video(
-                    "me",
-                    video=part,
-                    thumb=t,
-                    supports_streaming=True,
-                    progress=tg_progress,
-                    progress_args=(msg, "⬆️ Uploading"),
-                )
+                album_videos.append(part)
+                album_thumbs.append(t)
 
-                os.remove(part)
-                os.remove(t)
+                if len(album_videos) == 10:
+                    await send_album(client, album_videos, album_thumbs)
+                    for v, th in zip(album_videos, album_thumbs):
+                        os.remove(v)
+                        os.remove(th)
+                    album_videos.clear()
+                    album_thumbs.clear()
+
+            if album_videos:
+                await send_album(client, album_videos, album_thumbs)
+                for v, th in zip(album_videos, album_thumbs):
+                    os.remove(v)
+                    os.remove(th)
 
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-        await msg.edit("✅ Done")
+        await status.edit("✅ Done")
 
     active = False
 
 # ================= COMMANDS =================
 
 @app.on_message(filters.command("cancel"))
-async def cancel(client, msg):
+async def cancel(_, msg):
     global cancel_flag
     cancel_flag = True
     queue.clear()
