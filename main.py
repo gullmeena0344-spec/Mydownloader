@@ -17,7 +17,7 @@ API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
 DOWNLOAD_DIR = Path("output")
-MAX_TG_SIZE = 2000 * 1024 * 1024
+MAX_TG_SIZE = 1990 * 1024 * 1024
 MIN_FREE_SPACE_MB = 300 # Lowered slightly to give you more room
 
 logging.basicConfig(level=logging.INFO)
@@ -97,26 +97,30 @@ async def monitor_download(folder, status_msg):
             try: await status_msg.edit(f"⬇️ Downloading...\nSize: {format_bytes(total)}")
             except: pass
 
-@app.on_message(filters.text & filters.outgoing)
+@app.on_message(filters.text & (filters.outgoing | filters.private))
 async def handler(client, message: Message):
-    m = re.search(r"https?://gofile\.io/d/\w+", message.text)
+    log.info(f"Checking message: {message.text[:50]}...")
+    m = re.search(r"gofile\.io/d/([\w\-]+)", message.text)
     if not m: return
 
+    gofile_id = m.group(1)
+    log.info(f"Found GoFile link: {m.group(0)} (ID: {gofile_id})")
     if get_free_space() < MIN_FREE_SPACE_MB * 1024 * 1024:
         return await message.reply("❌ Disk Full.")
 
     status = await message.reply("⬇️ Starting Download...")
     shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-    DOWNLOAD_DIR.mkdir(exist_ok=True)
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     # Download
-    dl_task = asyncio.to_thread(GoFile().execute, dir=str(DOWNLOAD_DIR), url=m.group(0), num_threads=1)
+    dl_task = asyncio.to_thread(GoFile().execute, dir=str(DOWNLOAD_DIR), content_id=gofile_id, num_threads=1)
     mon_task = asyncio.create_task(monitor_download(DOWNLOAD_DIR, status))
     try: await dl_task
     finally: mon_task.cancel()
 
-    files = [p for p in DOWNLOAD_DIR.rglob("*") if p.is_file() and not p.name.endswith(('.jpg', '.txt'))]
-    if not files: return await status.edit("❌ No files.")
+    files = [p for p in DOWNLOAD_DIR.rglob("*") if p.is_file() and not p.name.endswith(('.jpg', '.txt', '.part'))]
+    log.info(f"Found {len(files)} files to upload.")
+    if not files: return await status.edit("❌ No files found after download.")
 
     for f in files:
         # Step 1: Sanitize Name (Remove spaces/special chars)
@@ -126,25 +130,52 @@ async def handler(client, message: Message):
         
         try:
             # Step 2: Process Metadata
-            await status.edit(f"⚙️ Optimizing: {clean_name}")
+            await status.edit(f"⚙️ Checking format: {clean_name}")
+            
+            # Use original if not a standard video or if processing fails
             fixed_path = new_path.with_suffix(".fixed.mp4")
-            await asyncio.to_thread(process_video_sync, str(new_path), str(fixed_path))
-            os.replace(fixed_path, new_path) # Replace original with optimized
+            try:
+                # Try to remux to MP4 for Telegram compatibility
+                # We use a try block for the subprocess to avoid crashing the whole loop
+                await asyncio.to_thread(process_video_sync, str(new_path), str(fixed_path))
+                if os.path.exists(fixed_path) and os.path.getsize(fixed_path) > 10000: # 10KB threshold
+                    log.info(f"Optimization successful for {clean_name}")
+                    os.replace(fixed_path, new_path)
+                else:
+                    log.warning(f"Optimization produced tiny/no file for {clean_name}, using original")
+                    if os.path.exists(fixed_path): os.remove(fixed_path)
+            except Exception as pe:
+                log.warning(f"Processing failed for {clean_name}, sending as is: {pe}")
+                if os.path.exists(fixed_path): os.remove(fixed_path)
 
             # Step 3: Thumbnail
             thumb_path = new_path.with_suffix(".jpg")
-            await asyncio.to_thread(thumb_sync, str(new_path), str(thumb_path))
+            try:
+                await asyncio.to_thread(thumb_sync, str(new_path), str(thumb_path))
+            except:
+                pass
 
             # Step 4: Split and Upload
             parts = await asyncio.to_thread(split_sync, str(new_path))
             for i, p in enumerate(parts):
-                await client.send_video(
-                    "me", video=p,
-                    thumb=str(thumb_path) if thumb_path.exists() else None,
-                    caption=f"Part {i+1}/{len(parts)}",
-                    progress=progress_bar,
-                    progress_args=(status, f"⬆️ Uploading Part {i+1}")
-                )
+                # Use send_video if possible, else send_document
+                try:
+                    await client.send_video(
+                        "me", video=p,
+                        thumb=str(thumb_path) if thumb_path.exists() else None,
+                        caption=f"Part {i+1}/{len(parts)}",
+                        progress=progress_bar,
+                        progress_args=(status, f"⬆️ Uploading Part {i+1}")
+                    )
+                except Exception as ve:
+                    log.warning(f"send_video failed, trying send_document: {ve}")
+                    await client.send_document(
+                        "me", document=p,
+                        thumb=str(thumb_path) if thumb_path.exists() else None,
+                        caption=f"Part {i+1}/{len(parts)} (Document Fallback)",
+                        progress=progress_bar,
+                        progress_args=(status, f"⬆️ Uploading Part {i+1}")
+                    )
                 os.remove(p)
 
             if thumb_path.exists(): os.remove(thumb_path)
