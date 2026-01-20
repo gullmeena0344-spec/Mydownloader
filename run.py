@@ -288,10 +288,11 @@ class GoFile(metaclass=GoFileMeta):
                 else:
                     logger.error("invalid password")
 
-        elif url and url.startswith("https://gofile.io/d/"):
-            files = self.get_files(dir, url.split("/")[-1], password, includes, excludes)
+        elif url and "gofile.io/d/" in url:
+            content_id = url.split("/d/")[-1].split("?")[0].strip("/")
+            files = self.get_files(dir, content_id=content_id, password=password, includes=includes, excludes=excludes)
         else:
-            logger.error("invalid parameters")
+            logger.error(f"invalid parameters: content_id={content_id}, url={url}")
 
         return files
 
