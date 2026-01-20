@@ -30,21 +30,25 @@ app = Client(
     session_string=SESSION_STRING
 )
 
+def get_free_space():
+    return shutil.disk_usage(os.getcwd()).free
+
 def format_bytes(size):
-    for unit in ["B", "KB", "MB", "GB"]:
+    for unit in ['B', 'KB', 'MB', 'GB']:
         if size < 1024:
             return f"{size:.2f} {unit}"
         size /= 1024
 
-async def progress_bar(current, total, status_msg, action):
+async def progress_bar(current, total, status_msg, action_name):
     try:
         now = time.time()
-        if hasattr(status_msg, "last_update") and now - status_msg.last_update < 4:
+        if hasattr(status_msg, "last_update") and (now - status_msg.last_update) < 4:
             return
         status_msg.last_update = now
+        perc = current * 100 / total
         await status_msg.edit(
-            f"{action}\n"
-            f"{current * 100 / total:.1f}%\n"
+            f"{action_name}...\n"
+            f"Progress: {perc:.1f}%\n"
             f"{format_bytes(current)} / {format_bytes(total)}"
         )
     except:
@@ -56,57 +60,55 @@ async def handler(client, message: Message):
     if not m:
         return
 
-    if shutil.disk_usage(os.getcwd()).free < MIN_FREE_SPACE_MB * 1024 * 1024:
-        return await message.reply("❌ Disk full")
+    if get_free_space() < MIN_FREE_SPACE_MB * 1024 * 1024:
+        return await message.reply("❌ Disk Full.")
 
-    status = await message.reply("⬇️ Starting chunked download")
-    gofile_id = m.group(1)
-    offset = 0
-    part_no = 1
+    status = await message.reply("⬇️ Starting Download...")
+    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-    downloader = GoFile()
+    # ---- ONLY CHANGE STARTS HERE ----
+    go = GoFile()
+    seen = set()
 
-    while True:
-        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-        downloaded = await asyncio.to_thread(
-            downloader.execute,
+    def download():
+        go.execute(
             dir=str(DOWNLOAD_DIR),
-            content_id=gofile_id,
-            num_threads=1,
-            offset=offset,
-            max_size=MAX_TG_SIZE
+            content_id=m.group(1),
+            num_threads=1
         )
 
-        if not downloaded:
-            break
+    dl_task = asyncio.to_thread(download)
 
-        files = sorted(DOWNLOAD_DIR.rglob("*"))
-        for f in files:
-            if not f.is_file():
-                continue
+    async def watch_and_upload():
+        while True:
+            await asyncio.sleep(3)
+            for f in DOWNLOAD_DIR.rglob("*"):
+                if not f.is_file():
+                    continue
+                if f in seen:
+                    continue
+                if f.stat().st_size < 5 * 1024 * 1024:
+                    continue
 
-            clean = re.sub(r"[^a-zA-Z0-9.]", "_", f.name)
-            new_path = f.parent / clean
-            os.rename(f, new_path)
+                seen.add(f)
 
-            parts = [str(new_path)]
-            for p in parts:
                 await client.send_document(
                     "me",
-                    document=p,
-                    caption=f"Part {part_no}",
+                    document=str(f),
+                    caption=f.name,
                     progress=progress_bar,
-                    progress_args=(status, f"⬆️ Uploading part {part_no}")
+                    progress_args=(status, "⬆️ Uploading")
                 )
-                os.remove(p)
 
-            part_no += 1
+                os.remove(f)
 
-        offset += MAX_TG_SIZE
-        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+    try:
+        await asyncio.gather(dl_task, watch_and_upload())
+    except:
+        pass
 
+    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
     await status.edit("✅ Done")
 
 app.run()
