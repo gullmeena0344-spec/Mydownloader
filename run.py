@@ -13,10 +13,6 @@ import shutil
 from tqdm import tqdm
 
 
-# ---------------- CONFIG ----------------
-
-MAX_TMP_BYTES = int(3.5 * 1024 * 1024 * 1024)  # 3.5GB hard safety cap
-
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s][%(funcName)20s()][%(levelname)-8s]: %(message)s",
@@ -25,25 +21,12 @@ logging.basicConfig(
 logger = logging.getLogger("GoFile")
 
 
-# ---------------- HELPERS ----------------
-
-def disk_used_bytes(base="."):
-    total = 0
-    for root, _, files in os.walk(base):
-        for f in files:
-            try:
-                total += os.path.getsize(os.path.join(root, f))
-            except:
-                pass
-    return total
-
-
-# ---------------- CLASSES ----------------
-
 class File:
-    def __init__(self, link: str, dest: str):
+    def __init__(self, link: str, dest: str, offset=0, max_size=None):
         self.link = link
         self.dest = dest
+        self.offset = offset
+        self.max_size = max_size
 
     def __str__(self):
         return f"{self.dest} ({self.link})"
@@ -55,188 +38,129 @@ class Downloader:
         self.progress_lock = Lock()
         self.progress_bar = None
 
-    def _check_disk_limit(self):
-        if disk_used_bytes() >= MAX_TMP_BYTES:
-            raise RuntimeError("Disk limit reached")
-
     def _get_total_size(self, link):
         r = requests.head(link, headers={"Cookie": f"accountToken={self.token}"})
         r.raise_for_status()
-        return int(r.headers["Content-Length"]), r.headers.get("Accept-Ranges") == "bytes"
-
-    def _download_range(self, link, start, end, temp_file, i):
-        existing = os.path.getsize(temp_file) if os.path.exists(temp_file) else 0
-        range_start = start + existing
-        if range_start > end:
-            return i
-
-        headers = {
-            "Cookie": f"accountToken={self.token}",
-            "Range": f"bytes={range_start}-{end}"
-        }
-
-        with requests.get(link, headers=headers, stream=True) as r:
-            r.raise_for_status()
-            with open(temp_file, "ab") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        self._check_disk_limit()
-                        f.write(chunk)
-                        with self.progress_lock:
-                            self.progress_bar.update(len(chunk))
-        return i
-
-    def _merge_temp_files(self, temp_dir, dest, num_threads):
-        with open(dest, "wb") as out:
-            for i in range(num_threads):
-                part = os.path.join(temp_dir, f"part_{i}")
-                with open(part, "rb") as pf:
-                    shutil.copyfileobj(pf, out)
-                os.remove(part)
-        shutil.rmtree(temp_dir)
+        return int(r.headers["Content-Length"]), r.headers.get("Accept-Ranges", "none") == "bytes"
 
     def download(self, file: File, num_threads=1):
         link = file.link
         dest = file.dest
-        temp_dir = dest + "_parts"
+        offset = file.offset
+        max_size = file.max_size
 
-        try:
-            total_size, support_range = self._get_total_size(link)
+        total_size, support_range = self._get_total_size(link)
 
-            if os.path.exists(dest) and os.path.getsize(dest) == total_size:
-                return
+        if offset >= total_size:
+            return False
 
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
+        end = total_size - 1
+        if max_size:
+            end = min(end, offset + max_size - 1)
 
-            # ---------- SINGLE THREAD ----------
-            if num_threads == 1 or not support_range:
-                temp_file = dest + ".part"
-                downloaded = os.path.getsize(temp_file) if os.path.exists(temp_file) else 0
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
 
-                self.progress_bar = tqdm(
-                    total=total_size,
-                    initial=downloaded,
-                    unit="B",
-                    unit_scale=True,
-                    desc=f"Downloading {os.path.basename(dest)}"
-                )
+        headers = {
+            "Cookie": f"accountToken={self.token}",
+            "Range": f"bytes={offset}-{end}"
+        }
 
-                headers = {
-                    "Cookie": f"accountToken={self.token}",
-                    "Range": f"bytes={downloaded}-"
-                }
+        self.progress_bar = tqdm(
+            total=end - offset + 1,
+            unit="B",
+            unit_scale=True,
+            desc=f"Downloading {os.path.basename(dest)}"
+        )
 
-                with requests.get(link, headers=headers, stream=True) as r:
-                    r.raise_for_status()
-                    with open(temp_file, "ab") as f:
-                        for chunk in r.iter_content(chunk_size=8192):
-                            if chunk:
-                                self._check_disk_limit()
-                                f.write(chunk)
-                                self.progress_bar.update(len(chunk))
+        with requests.get(link, headers=headers, stream=True) as r:
+            r.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        self.progress_bar.update(len(chunk))
 
-                self.progress_bar.close()
-                os.rename(temp_file, dest)
+        self.progress_bar.close()
+        return end + 1 < total_size
 
-            # ---------- MULTI THREAD ----------
-            else:
-                if os.path.exists(dest + ".part"):
-                    os.remove(dest + ".part")
-
-                if not os.path.exists(temp_dir):
-                    os.makedirs(temp_dir, exist_ok=True)
-
-                part_size = math.ceil(total_size / num_threads)
-                downloaded = sum(
-                    os.path.getsize(os.path.join(temp_dir, f"part_{i}"))
-                    for i in range(num_threads)
-                    if os.path.exists(os.path.join(temp_dir, f"part_{i}"))
-                )
-
-                self.progress_bar = tqdm(
-                    total=total_size,
-                    initial=downloaded,
-                    unit="B",
-                    unit_scale=True,
-                    desc=f"Downloading {os.path.basename(dest)}"
-                )
-
-                with ThreadPoolExecutor(max_workers=num_threads) as exe:
-                    futures = []
-                    for i in range(num_threads):
-                        start = i * part_size
-                        end = min(start + part_size - 1, total_size - 1)
-                        futures.append(
-                            exe.submit(
-                                self._download_range,
-                                link, start, end,
-                                os.path.join(temp_dir, f"part_{i}"),
-                                i
-                            )
-                        )
-                    for f in as_completed(futures):
-                        f.result()
-
-                self.progress_bar.close()
-                self._merge_temp_files(temp_dir, dest, num_threads)
-
-        except RuntimeError:
-            if self.progress_bar:
-                self.progress_bar.close()
-            logger.warning("Disk limit reached — download paused safely")
-            raise
-
-        except Exception as e:
-            if self.progress_bar:
-                self.progress_bar.close()
-            logger.error(f"Download failed: {e}")
-
-
-# ---------------- GOFILE CORE ----------------
 
 class GoFileMeta(type):
     _instances = {}
 
     def __call__(cls, *args, **kwargs):
         if cls not in cls._instances:
-            cls._instances[cls] = super().__call__(*args, **kwargs)
+            instance = super().__call__(*args, **kwargs)
+            cls._instances[cls] = instance
         return cls._instances[cls]
 
 
 class GoFile(metaclass=GoFileMeta):
-    def __init__(self):
+    def __init__(self) -> None:
         self.token = ""
         self.wt = ""
         self.lock = Lock()
 
-    def update_token(self):
+    def update_token(self) -> None:
         if not self.token:
             data = requests.post("https://api.gofile.io/accounts").json()
             if data["status"] == "ok":
                 self.token = data["data"]["token"]
             else:
-                raise Exception("Token fetch failed")
+                raise Exception("cannot get token")
 
-    def update_wt(self):
+    def update_wt(self) -> None:
         if not self.wt:
             js = requests.get("https://gofile.io/dist/js/config.js").text
             self.wt = js.split('appdata.wt = "')[1].split('"')[0]
 
-    def execute(self, dir, content_id=None, url=None, password=None,
-                proxy=None, num_threads=1, includes=None, excludes=None):
+    def execute(
+        self,
+        dir: str,
+        content_id: str = None,
+        url: str = None,
+        password: str = None,
+        proxy: str = None,
+        num_threads: int = 1,
+        includes: list[str] = None,
+        excludes: list[str] = None,
+        offset: int = 0,
+        max_size: int = None
+    ) -> bool:
 
-        files = self.get_files(dir, content_id, url, password, includes, excludes)
-        for f in files:
-            Downloader(self.token).download(f, num_threads)
+        if proxy:
+            os.environ['HTTP_PROXY'] = proxy
+            os.environ['HTTPS_PROXY'] = proxy
+        else:
+            os.environ.pop('HTTP_PROXY', None)
+            os.environ.pop('HTTPS_PROXY', None)
 
-    def is_included(self, name, includes):
-        return True if not includes else any(fnmatch.fnmatch(name, p) for p in includes)
+        files = self.get_files(dir, content_id, url, password, includes, excludes, offset, max_size)
+        if not files:
+            return False
 
-    def is_excluded(self, name, excludes):
-        return False if not excludes else any(fnmatch.fnmatch(name, p) for p in excludes)
+        more = False
+        for file in files:
+            more = Downloader(self.token).download(file, num_threads)
 
-    def get_files(self, dir, content_id=None, url=None, password=None,
-                  includes=None, excludes=None):
+        return more
+
+    def is_included(self, filename: str, includes: list[str]) -> bool:
+        return True if not includes else any(fnmatch.fnmatch(filename, p) for p in includes)
+
+    def is_excluded(self, filename: str, excludes: list[str]) -> bool:
+        return False if not excludes else any(fnmatch.fnmatch(filename, p) for p in excludes)
+
+    def get_files(
+        self,
+        dir: str,
+        content_id: str = None,
+        url: str = None,
+        password: str = None,
+        includes: list[str] = None,
+        excludes: list[str] = None,
+        offset: int = 0,
+        max_size: int = None
+    ) -> list[File]:
 
         includes = includes or []
         excludes = excludes or []
@@ -246,28 +170,37 @@ class GoFile(metaclass=GoFileMeta):
             self.update_token()
             self.update_wt()
 
-            pwd = hashlib.sha256(password.encode()).hexdigest() if password else ""
+            hash_password = hashlib.sha256(password.encode()).hexdigest() if password else ""
             data = requests.get(
-                f"https://api.gofile.io/contents/{content_id}?cache=true&password={pwd}",
+                f"https://api.gofile.io/contents/{content_id}?cache=true&password={hash_password}",
                 headers={
-                    "Authorization": f"Bearer {self.token}",
-                    "X-Website-Token": self.wt
-                }
+                    "Authorization": "Bearer " + self.token,
+                    "X-Website-Token": self.wt,
+                },
             ).json()
 
             if data["status"] != "ok":
                 return files
 
-            for _, item in data["data"]["children"].items():
-                if item["type"] == "file":
-                    if self.is_included(item["name"], includes) and not self.is_excluded(item["name"], excludes):
+            for _, child in data["data"]["children"].items():
+                if child["type"] == "file":
+                    name = child["name"]
+                    if self.is_included(name, includes) and not self.is_excluded(name, excludes):
                         files.append(
-                            File(item["link"], os.path.join(dir, sanitize_filename(item["name"])))
+                            File(
+                                child["link"],
+                                os.path.join(dir, sanitize_filename(name)),
+                                offset,
+                                max_size
+                            )
                         )
+
+        elif url and "gofile.io/d/" in url:
+            content_id = url.split("/d/")[-1].split("?")[0].strip("/")
+            return self.get_files(dir, content_id, password=password, includes=includes, excludes=excludes, offset=offset, max_size=max_size)
+
         return files
 
-
-# ---------------- CLI ----------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
