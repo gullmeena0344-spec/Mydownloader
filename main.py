@@ -5,6 +5,7 @@ import shutil
 import time
 import logging
 import subprocess
+import requests
 from pathlib import Path
 
 from pyrogram import Client, filters
@@ -66,11 +67,22 @@ def faststart_mp4(src):
 
 def make_thumb(src):
     t = src + ".jpg"
+
+    # try at 1 second
     subprocess.run(
         ["ffmpeg", "-y", "-i", src, "-ss", "00:00:01", "-vframes", "1", t],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
+
+    # fallback: first frame
+    if not os.path.exists(t):
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", src, "-vframes", "1", t],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
     return t if os.path.exists(t) else None
 
 def normalize_path(p):
@@ -79,16 +91,57 @@ def normalize_path(p):
 # ---------------- SMART DOWNLOAD ----------------
 
 async def smart_download(url):
-    # --- DIRECT MP4 / MOV (signed links) ---
-    if re.search(r"\.(mp4|mov)(\?|$)", url):
-        out = DOWNLOAD_DIR / "direct.mp4"
+    # ---------- PIXELDRAIN ALBUM (API, like GoFile) ----------
+    m = re.search(r"pixeldrain\.com/l/(\w+)", url)
+    if m:
+        r = requests.get(f"https://pixeldrain.com/api/list/{m.group(1)}").json()
+        files = []
+
+        for f in r.get("files", []):
+            out = DOWNLOAD_DIR / f["name"]
+            subprocess.run(
+                [
+                    "aria2c",
+                    "-x", "8", "-s", "8", "-k", "1M",
+                    "-o", str(out),
+                    f"https://pixeldrain.com/api/file/{f['id']}"
+                ],
+                check=True
+            )
+            files.append(out)
+
+        return files
+
+    # ---------- PIXELDRAIN SINGLE ----------
+    if re.search(r"pixeldrain\.com/u/", url):
+        out = DOWNLOAD_DIR / "pixeldrain.mp4"
         subprocess.run(
             ["aria2c", "-x", "8", "-s", "8", "-k", "1M", "-o", str(out), url],
             check=True
         )
         return [out]
 
-    # --- EMBED / HLS / SITES ---
+    # ---------- DIRECT MP4 / MOV (aria2 → yt-dlp fallback) ----------
+    if re.search(r"\.(mp4|mov)(\?|$)", url):
+        out = DOWNLOAD_DIR / "direct.mp4"
+        try:
+            subprocess.run(
+                ["aria2c", "-x", "8", "-s", "8", "-k", "1M", "-o", str(out), url],
+                check=True
+            )
+        except subprocess.CalledProcessError:
+            subprocess.run(
+                [
+                    "yt-dlp",
+                    "-o", str(out),
+                    "--merge-output-format", "mp4",
+                    url
+                ],
+                check=True
+            )
+        return [out]
+
+    # ---------- EMBED / HLS / OTHER ----------
     cmd = [
         "yt-dlp",
         "--no-playlist",
