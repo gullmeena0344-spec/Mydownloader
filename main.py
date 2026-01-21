@@ -11,15 +11,14 @@ from pathlib import Path
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from run import GoFile, Downloader, File # Uses your existing run.py
+from run import GoFile, Downloader, File 
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
 DOWNLOAD_DIR = Path("output")
-# 1.5GB is safer for a 4GB disk than 1.9GB
-MAX_TG_SIZE = 1500 * 1024 * 1024 
+MAX_TG_SIZE = 1500 * 1024 * 1024 # 1.5GB
 MIN_FREE_SPACE_MB = 400
 
 logging.basicConfig(level=logging.INFO)
@@ -43,63 +42,38 @@ def format_bytes(size):
             return f"{size:.2f} {unit}"
         size /= 1024
 
-def get_progress_bar(percent, total=20):
-    filled = int(total * percent // 100)
-    bar = "█" * filled + "░" * (total - filled)
-    return f"[{bar}] {percent:.1f}%"
-
 async def progress_bar(current, total, status_msg, action_name):
     try:
         now = time.time()
-        if hasattr(status_msg, "last_update") and (now - status_msg.last_update) < 3:
+        if hasattr(status_msg, "last_update") and (now - status_msg.last_update) < 4:
             return
         status_msg.last_update = now
-        perc = current * 100 / total
-        bar = get_progress_bar(perc)
-        await status_msg.edit(
-            f"{action_name}\n{bar}\n"
-            f"{format_bytes(current)} / {format_bytes(total)}"
-        )
-    except:
-        pass
+        perc = (current * 100 / total) if total > 0 else 0
+        filled = int(20 * perc // 100)
+        bar = "█" * filled + "░" * (20 - filled)
+        await status_msg.edit(f"{action_name}\n[{bar}] {perc:.1f}%\n{format_bytes(current)} / {format_bytes(total)}")
+    except: pass
 
-# ---------------- Video Processing (Fixed) ----------------
+def make_thumb(video_path):
+    """Generates a reliable thumbnail at 10 seconds."""
+    if not os.path.exists(video_path):
+        return None
+    thumb_path = video_path + ".jpg"
+    # ss 10 skips the blue/black screen. -vf scale handles the size.
+    cmd = [
+        "ffmpeg", "-y", "-ss", "00:00:10", "-i", video_path,
+        "-vframes", "1", "-vf", "scale=320:-1", thumb_path
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return thumb_path if os.path.exists(thumb_path) else None
 
-def faststart_mp4(src):
-    """Moves metadata to start. Disk safe: removes src if possible."""
-    dst = src + ".fast.mp4"
-    # Check if we have enough space for a second copy (src size)
-    if get_free_space() < os.path.getsize(src):
-        log.warning("Not enough space for faststart. Uploading original.")
-        return src
-    
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", dst],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    if os.path.exists(dst):
-        if os.path.exists(src): os.remove(src) # Delete raw immediately
-        return dst
-    return src
-
-def make_thumb(src):
-    """Generates thumb at 10s to avoid blue/black screens."""
-    thumb = src + ".jpg"
-    # ss 00:00:10 skips the blue screen/intro, scale=320 is standard for TG
-    subprocess.run(
-        ["ffmpeg", "-y", "-ss", "00:00:10", "-i", src, "-vframes", "1", "-vf", "scale=320:-1", thumb],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    return thumb if os.path.exists(thumb) else None
-
-# ---------------- Smart Download (Pixeldrain/yt-dlp) ----------------
+# ---------------- Smart Download ----------------
 
 async def smart_download(url, status):
-    """Generic downloader for Pixeldrain/Generic links."""
     # Pixeldrain List logic
-    m = re.search(r"pixeldrain\.com/l/(\w+)", url)
-    if m:
-        r = requests.get(f"https://pixeldrain.com/api/list/{m.group(1)}").json()
+    if "pixeldrain.com/l/" in url:
+        list_id = url.split("/")[-1]
+        r = requests.get(f"https://pixeldrain.com/api/list/{list_id}").json()
         files = []
         for f in r.get("files", []):
             out = DOWNLOAD_DIR / f['name']
@@ -108,34 +82,32 @@ async def smart_download(url, status):
             files.append(out)
         return files
 
-    # Single Link (Pixeldrain / Others)
-    await status.edit("Downloading generic link...")
+    # Direct MP4 or Generic
+    await status.edit("Downloading link...")
     out = DOWNLOAD_DIR / "%(title)s.%(ext)s"
     subprocess.run(["yt-dlp", "-o", str(out), "--merge-output-format", "mp4", url], check=True)
     return list(DOWNLOAD_DIR.glob("*"))
 
-# ---------------- Main Handler ----------------
+# ---------------- Handler ----------------
 
 @app.on_message(filters.text & (filters.outgoing | filters.private))
 async def handler(client, message: Message):
     text = message.text.strip()
     if not text.startswith("http"): return
-
     if get_free_space() < MIN_FREE_SPACE_MB * 1024 * 1024:
         return await message.reply("Disk Full.")
 
-    status = await message.reply("Analyzing Link...")
+    status = await message.reply("Analyzing...")
     shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
-        # GOFILE LOGIC
-        gofile_match = re.search(r"gofile\.io/d/([\w\-]+)", text)
-        if gofile_match:
+        # 1. GOFILE LOGIC
+        if "gofile.io/d/" in text:
             go = GoFile()
-            files = go.get_files(dir=str(DOWNLOAD_DIR), content_id=gofile_match.group(1))
-            if not files: return await status.edit("GoFile Folder is empty or 401.")
-
+            m = re.search(r"gofile\.io/d/([\w\-]+)", text)
+            files = go.get_files(dir=str(DOWNLOAD_DIR), content_id=m.group(1))
+            
             for idx, file in enumerate(files, 1):
                 file_name = os.path.basename(file.dest)
                 upload_queue = asyncio.Queue()
@@ -147,7 +119,7 @@ async def handler(client, message: Message):
 
                 async def download_task():
                     try:
-                        # Ensures Guest Token is valid
+                        # Downloader in run.py already does faststart!
                         await asyncio.to_thread(Downloader(token=go.token).download, file, 1, on_part_ready)
                     finally:
                         download_complete.set()
@@ -161,52 +133,54 @@ async def handler(client, message: Message):
                         if get_task in done:
                             path, part_num, total_parts = await get_task
                             if wait_task in pending: wait_task.cancel()
-                            if not os.path.exists(path): continue
-
-                            caption = file_name if total_parts == 1 else f"{file_name} [Part {part_num}/{total_parts}]"
-                            await status.edit(f"[{idx}/{len(files)}] Processing Part {part_num}/{total_parts}...")
-
-                            # Fix thumbnail and streaming
-                            fixed = faststart_mp4(str(path))
-                            thumb = make_thumb(fixed)
-
+                            
+                            await status.edit(f"[{idx}/{len(files)}] Uploading Part {part_num}...")
+                            
+                            # GENERATE THUMB FROM THE READY PART
+                            thumb = make_thumb(str(path))
+                            caption = file_name if total_parts == 1 else f"{file_name} (Part {part_num}/{total_parts})"
+                            
                             await client.send_video(
-                                "me", video=fixed, caption=caption, supports_streaming=True, thumb=thumb,
-                                progress=progress_bar, progress_args=(status, f"[{idx}/{len(files)}] Uploading {part_num}/{total_parts}")
+                                "me", video=str(path), caption=caption, 
+                                thumb=thumb, supports_streaming=True,
+                                progress=progress_bar, 
+                                progress_args=(status, f"[{idx}/{len(files)}] Uploading Part {part_num}")
                             )
-                            # Immediate cleanup of segments to keep 4GB disk free
-                            for f in (path, fixed, thumb):
-                                try:
-                                    if f and os.path.exists(f): os.remove(f)
-                                except: pass
+                            
+                            # CLEANUP
+                            if os.path.exists(path): os.remove(path)
+                            if thumb and os.path.exists(thumb): os.remove(thumb)
                         else:
                             if get_task in pending: get_task.cancel()
                             if upload_queue.empty(): break
 
                 await asyncio.gather(download_task(), upload_task())
 
-        # GENERIC LOGIC (Pixeldrain / YouTube / etc)
+        # 2. GENERIC LOGIC (Direct MP4, Pixeldrain, etc)
         else:
-            downloaded_files = await smart_download(text, status)
-            for idx, f in enumerate(downloaded_files, 1):
+            downloaded = await smart_download(text, status)
+            for idx, f in enumerate(downloaded, 1):
                 f_path = str(f)
-                await status.edit(f"Processing {os.path.basename(f_path)}...")
+                await status.edit(f"Processing video {idx}...")
                 
-                # If using your run.py for splitting, you could call Downloader here, 
-                # but for simplicity we process directly or assume yt-dlp handled it.
-                fixed = faststart_mp4(f_path)
-                thumb = make_thumb(fixed)
+                # Apply faststart for direct downloads
+                fixed = f_path + ".fast.mp4"
+                subprocess.run(["ffmpeg", "-y", "-i", f_path, "-c", "copy", "-movflags", "+faststart", fixed], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                
+                final_path = fixed if os.path.exists(fixed) else f_path
+                thumb = make_thumb(final_path)
 
                 await client.send_video(
-                    "me", video=fixed, caption=os.path.basename(fixed), supports_streaming=True, thumb=thumb,
-                    progress=progress_bar, progress_args=(status, f"Uploading {idx}/{len(downloaded_files)}")
+                    "me", video=final_path, caption=os.path.basename(f_path), 
+                    thumb=thumb, supports_streaming=True,
+                    progress=progress_bar, progress_args=(status, f"Uploading video {idx}")
                 )
+                
+                # CLEANUP
                 for x in (f_path, fixed, thumb):
-                    try:
-                        if x and os.path.exists(x): os.remove(x)
-                    except: pass
+                    if x and os.path.exists(x): os.remove(x)
 
-        await status.edit("✅ All finished!")
+        await status.edit("✅ All tasks complete.")
 
     except Exception as e:
         log.exception(e)
