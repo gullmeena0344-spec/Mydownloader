@@ -13,14 +13,12 @@ from pathvalidate import sanitize_filename
 import shutil
 from tqdm import tqdm
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s][%(funcName)20s()][%(levelname)-8s]: %(message)s",
     handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger("GoFile")
-
 
 class File:
     def __init__(self, link: str, dest: str):
@@ -29,7 +27,6 @@ class File:
 
     def __str__(self):
         return f"{self.dest} ({self.link})"
-
 
 class Downloader:
     def __init__(self, token):
@@ -135,7 +132,6 @@ class Downloader:
             logger.error(f"failed to download ({e}): {dest} ({link})")
             raise
 
-
 class GoFileMeta(type):
     _instances = {}
 
@@ -144,7 +140,6 @@ class GoFileMeta(type):
             instance = super().__call__(*args, **kwargs)
             cls._instances[cls] = instance
         return cls._instances[cls]
-
 
 class GoFile(metaclass=GoFileMeta):
     def __init__(self) -> None:
@@ -231,7 +226,6 @@ class GoFile(metaclass=GoFileMeta):
             files = self.get_files(dir, content_id=content_id, password=password)
 
         return files
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
