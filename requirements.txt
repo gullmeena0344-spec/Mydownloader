@@ -8,3 +8,4 @@ tqdm==4.67.1
 pyrogram
 tgcrypto
 yt-dlp
+aiohttp
