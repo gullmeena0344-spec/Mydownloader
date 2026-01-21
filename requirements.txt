@@ -7,3 +7,4 @@ urllib3==2.2.1
 tqdm==4.67.1
 pyrogram
 tgcrypto
+yt-dlp
