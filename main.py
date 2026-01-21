@@ -95,10 +95,14 @@ async def handler(client, message: Message):
             upload_queue = asyncio.Queue()
             download_complete = asyncio.Event()
 
+            # ✅ FIX: capture running loop
+            loop = asyncio.get_running_loop()
+
+            # ✅ FIX: use captured loop (no asyncio_0 error)
             def on_part_ready(path, part_num, total_parts, size):
                 asyncio.run_coroutine_threadsafe(
                     upload_queue.put((path, part_num, total_parts)),
-                    asyncio.get_event_loop()
+                    loop
                 )
 
             async def download_task():
@@ -116,7 +120,6 @@ async def handler(client, message: Message):
                     download_complete.set()
 
             async def upload_task():
-                uploaded = 0
                 while True:
                     try:
                         get_task = asyncio.create_task(upload_queue.get())
@@ -132,41 +135,35 @@ async def handler(client, message: Message):
                                 wait_task.cancel()
 
                             if not os.path.exists(path):
-                                log.error(f"File not found: {path}")
                                 continue
 
-                            caption = f"{file_name}"
+                            caption = file_name
                             if total_parts > 1:
                                 caption = f"{file_name} [Part {part_num}/{total_parts}]"
 
-                            await status.edit(f"[{idx}/{len(files)}] Uploading part {part_num}/{total_parts}...")
+                            await status.edit(
+                                f"[{idx}/{len(files)}] Uploading part {part_num}/{total_parts}..."
+                            )
 
                             try:
-                                result = await client.send_video(
+                                await client.send_video(
                                     "me",
                                     video=str(path),
                                     caption=caption,
                                     supports_streaming=True,
                                     progress=progress_bar,
-                                    progress_args=(status, f"[{idx}/{len(files)}] Uploading {part_num}/{total_parts}")
+                                    progress_args=(
+                                        status,
+                                        f"[{idx}/{len(files)}] Uploading {part_num}/{total_parts}"
+                                    )
                                 )
-
-                                if result:
-                                    log.info(f"Video sent successfully: {file_name} Part {part_num}/{total_parts}")
-                                    uploaded += 1
-                                else:
-                                    log.error(f"Failed to send video: {path}")
-                                    await status.edit(f"Failed to send: {file_name} part {part_num}")
-
                             except Exception as send_err:
                                 log.error(f"Send error: {send_err}")
-                                await status.edit(f"Send failed: {str(send_err)[:50]}")
 
                             try:
                                 os.remove(path)
                             except:
                                 pass
-
                         else:
                             if get_task in pending:
                                 get_task.cancel()
