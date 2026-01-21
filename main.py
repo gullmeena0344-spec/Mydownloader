@@ -56,6 +56,8 @@ async def progress_bar(current, total, status, title):
         f"{format_bytes(current)} / {format_bytes(total)}"
     )
 
+# ---------------- fixes applied ----------------
+
 def faststart_mp4(src):
     dst = src + ".fast.mp4"
     subprocess.run(
@@ -66,24 +68,13 @@ def faststart_mp4(src):
     return dst if os.path.exists(dst) else src
 
 def make_thumb(src):
-    t = src + ".jpg"
-    try:
-        # safer thumbnail generation (avoids blue screen)
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", src,
-                "-vf", "thumbnail,scale=320:180",
-                "-frames:v", "1", t
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True
-        )
-        if os.path.exists(t):
-            return t
-    except:
-        pass
-    return None
+    thumb = src + ".jpg"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", src, "-ss", "00:00:01", "-vframes", "1", thumb],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    return thumb if os.path.exists(thumb) else None
 
 def normalize_path(p):
     return str(p.dest) if hasattr(p, "dest") else str(p)
@@ -91,72 +82,55 @@ def normalize_path(p):
 # ---------------- SMART DOWNLOAD ----------------
 
 async def smart_download(url):
-    # ---------- PIXELDRAIN ALBUM (API, like GoFile) ----------
     m = re.search(r"pixeldrain\.com/l/(\w+)", url)
     if m:
         r = requests.get(f"https://pixeldrain.com/api/list/{m.group(1)}").json()
         files = []
-
         for idx, f in enumerate(r.get("files", []), 1):
-            out = DOWNLOAD_DIR / f"{idx}_{f['name']}"  # unique filename
+            out = DOWNLOAD_DIR / f"{idx}_{f['name']}"
             try:
                 subprocess.run(
-                    [
-                        "aria2c",
-                        "-x", "8", "-s", "8", "-k", "1M",
-                        "-o", str(out),
-                        f"https://pixeldrain.com/api/file/{f['id']}"
-                    ],
+                    ["aria2c","-x","8","-s","8","-k","1M","-o",str(out),f"https://pixeldrain.com/api/file/{f['id']}"],
                     check=True
                 )
                 files.append(out)
             except subprocess.CalledProcessError as e:
                 log.warning(f"Failed downloading {f['name']}: {e}")
-
         return files
 
-    # ---------- PIXELDRAIN SINGLE ----------
     if re.search(r"pixeldrain\.com/u/", url):
         out = DOWNLOAD_DIR / "pixeldrain.mp4"
         subprocess.run(
-            ["aria2c", "-x", "8", "-s", "8", "-k", "1M", "-o", str(out), url],
+            ["aria2c","-x","8","-s","8","-k","1M","-o",str(out),url],
             check=True
         )
         return [out]
 
-    # ---------- DIRECT MP4 / MOV (aria2 → yt-dlp fallback) ----------
     if re.search(r"\.(mp4|mov)(\?|$)", url):
-        out = DOWNLOAD_DIR / "%(title)s.%(ext)s"  # unique template for multiple videos
+        out = DOWNLOAD_DIR / "%(title)s.%(ext)s"
         try:
             subprocess.run(
-                ["aria2c", "-x", "8", "-s", "8", "-k", "1M", "-o", str(DOWNLOAD_DIR / "direct.mp4"), url],
+                ["aria2c","-x","8","-s","8","-k","1M","-o",str(DOWNLOAD_DIR / "direct.mp4"),url],
                 check=True
             )
         except subprocess.CalledProcessError:
             subprocess.run(
-                [
-                    "yt-dlp",
-                    "-o", str(out),
-                    "--merge-output-format", "mp4",  # fixed double dash
-                    url
-                ],
+                ["yt-dlp","-o",str(out),"--merge-output-format","mp4",url],
                 check=True
             )
         return list(DOWNLOAD_DIR.glob("*"))
 
-    # ---------- EMBED / HLS / OTHER ----------
     cmd = [
         "yt-dlp",
         "--no-playlist",
-        "--merge-output-format", "mp4",  # fixed double dash
+        "--merge-output-format","mp4",
         "--force-generic-extractor",
         "--hls-use-mpegts",
-        "--downloader", "aria2c",
-        "--downloader-args", "aria2c:-x 8 -s 8 -k 1M",
+        "--downloader","aria2c",
+        "--downloader-args","aria2c:-x 8 -s 8 -k 1M",
         "-o", str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
         url
     ]
-
     subprocess.run(cmd, check=True)
     return list(DOWNLOAD_DIR.glob("*"))
 
@@ -165,7 +139,6 @@ async def smart_download(url):
 @app.on_message(filters.text & (filters.outgoing | filters.private))
 async def handler(client, message: Message):
     text = message.text.strip()
-
     if get_free_space() < MIN_FREE_SPACE_MB * 1024 * 1024:
         return await message.reply("Disk Full.")
 
@@ -174,72 +147,68 @@ async def handler(client, message: Message):
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
-        # ---------- GOFILE ----------
         m = re.search(r"gofile\.io/d/([\w\-]+)", text)
         if m:
             go = GoFile()
             files = go.get_files(dir=str(DOWNLOAD_DIR), content_id=m.group(1))
 
-            for f in files:
-                q = asyncio.Queue()
-                done = asyncio.Event()
+            for idx, f in enumerate(files,1):
+                file_name = os.path.basename(f.dest)
+                upload_queue = asyncio.Queue()
+                download_done = asyncio.Event()
                 loop = asyncio.get_running_loop()
 
                 def on_part(path, part, total, size):
-                    asyncio.run_coroutine_threadsafe(
-                        q.put((path, part, total)), loop
-                    )
+                    asyncio.run_coroutine_threadsafe(upload_queue.put((path, part, total)), loop)
 
-                async def dl():
+                async def download_task():
                     try:
-                        await asyncio.to_thread(
-                            Downloader(token=go.token).download,
-                            f, 1, on_part
-                        )
+                        await asyncio.to_thread(Downloader(token=go.token).download,f,1,on_part)
                     finally:
-                        done.set()
+                        download_done.set()
 
-                async def up():
+                async def upload_task():
                     while True:
-                        g = asyncio.create_task(q.get())
-                        w = asyncio.create_task(done.wait())
-                        done_set, _ = await asyncio.wait(
-                            [g, w], return_when=asyncio.FIRST_COMPLETED
-                        )
+                        get_task = asyncio.create_task(upload_queue.get())
+                        wait_task = asyncio.create_task(download_done.wait())
+                        done_set, pending = await asyncio.wait([get_task, wait_task], return_when=asyncio.FIRST_COMPLETED)
 
-                        if g in done_set:
-                            path, part, total = await g
-                            real = normalize_path(path)
-                            fixed = faststart_mp4(real)
+                        if get_task in done_set:
+                            path, part, total = await get_task
+                            if wait_task in pending: wait_task.cancel()
+                            if not os.path.exists(path): continue
+                            caption = file_name if total==1 else f"{file_name} [Part {part}/{total}]"
+                            await status.edit(f"[{idx}/{len(files)}] Uploading {part}/{total}...")
+                            fixed = faststart_mp4(str(path))
                             thumb = make_thumb(fixed)
-
-                            await client.send_video(
-                                "me",
-                                fixed,
-                                caption=f"{os.path.basename(real)} [{part}/{total}]",
-                                supports_streaming=True,
-                                thumb=thumb,
-                                progress=progress_bar,
-                                progress_args=(status, "Uploading")
-                            )
-
-                            for x in (real, fixed, thumb):
-                                if x and os.path.exists(x):
-                                    os.remove(x)
+                            try:
+                                await client.send_video(
+                                    "me",
+                                    fixed,
+                                    caption=caption,
+                                    supports_streaming=True,
+                                    thumb=thumb,
+                                    progress=progress_bar,
+                                    progress_args=(status,f"[{idx}/{len(files)}] Uploading {part}/{total}")
+                                )
+                            except Exception as send_err:
+                                log.error(f"Send error: {send_err}")
+                            for x in (path,fixed,thumb):
+                                try: os.remove(x)
+                                except: pass
                         else:
-                            break
+                            if get_task in pending: get_task.cancel()
+                            if upload_queue.empty(): break
 
-                await asyncio.gather(dl(), up())
+                await asyncio.gather(download_task(), upload_task())
 
-        # ---------- SMART DOWNLOAD ----------
         else:
             await status.edit("Downloading...")
             files = await smart_download(text)
 
-            for f in files:
+            for idx, f in enumerate(files,1):
                 fixed = faststart_mp4(str(f))
                 thumb = make_thumb(fixed)
-
                 await client.send_video(
                     "me",
                     fixed,
@@ -247,12 +216,11 @@ async def handler(client, message: Message):
                     supports_streaming=True,
                     thumb=thumb,
                     progress=progress_bar,
-                    progress_args=(status, "Uploading")
+                    progress_args=(status,"Uploading")
                 )
-
-                for x in (f, fixed, thumb):
-                    if x and os.path.exists(x):
-                        os.remove(x)
+                for x in (f,fixed,thumb):
+                    try: os.remove(x)
+                    except: pass
 
         await status.edit("All done!")
 
