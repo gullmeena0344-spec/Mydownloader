@@ -1,312 +1,358 @@
 import os
+import re
+import math
 import asyncio
 import shutil
 import time
 import logging
 import subprocess
-import re
-import aiohttp
-from urllib.parse import unquote
+import requests
 from pathlib import Path
+
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from run import GoFile, Downloader
+# Assuming run.py contains these classes
+from run import GoFile, Downloader, File
 
 # --- Config ---
-# Userbots need API_ID and SESSION_STRING. 
-# API_HASH is required for login.
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-SESSION_STRING = os.getenv("SESSION_STRING", "")
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+SESSION_STRING = os.getenv("SESSION_STRING")
 
-BASE_OUTPUT_DIR = Path("output")
-MIN_FREE_SPACE_MB = 400
+DOWNLOAD_DIR = Path("output")
+MAX_TG_SIZE = 1990 * 1024 * 1024
+MIN_FREE_SPACE_MB = 500
+MAX_PART_SIZE = 1900 * 1024 * 1024  # Adjusted to ~1.9GB for max efficiency
 
-logging.basicConfig(
-    format="[%(levelname)s] %(asctime)s - %(message)s",
-    level=logging.INFO,
-    handlers=[logging.StreamHandler()]
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("BOT")
+
+app = Client(
+    "gofile-userbot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING
 )
-log = logging.getLogger("USERBOT")
 
-app = Client("gofile-userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
-
-# ---------------- UTILS ----------------
+# ---------------- utils ----------------
 
 def get_free_space():
     return shutil.disk_usage(os.getcwd()).free
 
 def format_bytes(size):
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if size < 1024: return f"{size:.2f} {unit}"
+    for u in ["B", "KB", "MB", "GB"]:
+        if size < 1024:
+            return f"{size:.2f} {u}"
         size /= 1024
-    return f"{size:.2f} TB"
-
-def sanitize_filename(name):
-    name = re.sub(r'[<>:"/\\|?*]', '', name)
-    name = name.strip()
-    return name if name else "video.mp4"
 
 def get_progress_bar(percent, total=20):
     filled = int(total * percent // 100)
-    bar = "█" * filled + "░" * (total - filled)
-    return f"[{bar}] {percent:.1f}%"
+    return f"[{'█'*filled}{'░'*(total-filled)}] {percent:.1f}%"
 
-async def progress_bar(current, total, status_msg, action_name, is_percentage=False):
+async def progress_bar(current, total, status, title):
     try:
         now = time.time()
-        if not hasattr(status_msg, "last_update"):
-            status_msg.last_update = 0
-        
-        if (now - status_msg.last_update) < 3: 
+        if hasattr(status, "last") and now - status.last < 2:
             return
-
-        status_msg.last_update = now
-        
-        if is_percentage:
-            perc = current
-            bar = get_progress_bar(perc)
-            await status_msg.edit(f"{action_name}\n{bar}")
-        else:
-            perc = (current * 100 / total) if total > 0 else 0
-            bar = get_progress_bar(perc)
-            await status_msg.edit(f"{action_name}\n{bar}\n{format_bytes(current)} / {format_bytes(total)}")
-    except Exception: 
+        status.last = now
+        p = (current * 100 / total) if total > 0 else 0
+        await status.edit(
+            f"{title}\n{get_progress_bar(p)}\n"
+            f"{format_bytes(current)} / {format_bytes(total)}"
+        )
+    except:
         pass
 
-# ---------------- MEDIA PROCESSING ----------------
-
-def get_video_duration(src):
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", 
-             "-of", "default=noprint_wrappers=1:nokey=1", src],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15
-        )
-        return float(result.stdout.strip())
-    except: return 0.0
-
-def _make_thumb_sync(src):
-    thumb_path = src + ".jpg"
-    duration = get_video_duration(src)
-    
-    if duration > 5:
-        seek_time = str(int(duration * 0.20))
-    elif duration > 0:
-        seek_time = "00:00:01"
-    else:
-        seek_time = "00:00:00"
-
-    try:
-        cmd = ["ffmpeg", "-y", "-ss", seek_time, "-i", src, "-vframes", "1", 
-               "-vf", "scale=320:-1", "-q:v", "5", thumb_path]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
-            return thumb_path
-    except: pass
-    return None
-
-def _faststart_sync(src):
+def faststart_mp4(src):
     dst = src + ".fast.mp4"
     try:
-        subprocess.run(["ffmpeg", "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", dst],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        if os.path.exists(dst) and os.path.getsize(dst) > 0:
-            if os.path.exists(src): os.remove(src)
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", dst],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        if os.path.exists(dst):
             return dst
-    except: pass
+    except:
+        pass
     return src
 
-async def make_thumb(src):
-    return await asyncio.to_thread(_make_thumb_sync, src)
-
-async def faststart_mp4(src):
-    return await asyncio.to_thread(_faststart_sync, src)
-
-# ---------------- DOWNLOAD HELPERS ----------------
-
-async def download_file(url, dest_path, status_msg):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-    timeout = aiohttp.ClientTimeout(total=None)
-    connector = aiohttp.TCPConnector(ssl=False) 
-
+def make_thumb(src):
+    thumb = src + ".jpg"
     try:
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers) as session:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    log.error(f"HTTP Error {response.status}")
-                    return False
-                
-                total_size = int(response.headers.get("Content-Length", 0))
-                downloaded = 0
-                
-                with open(dest_path, "wb") as f:
-                    async for chunk in response.content.iter_chunked(1024 * 1024):
-                        if not chunk: break
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        await progress_bar(downloaded, total_size, status_msg, "⬇️ Downloading...")
-                return True
-    except Exception as e:
-        log.error(f"Download Exception: {e}")
-        return False
-
-async def ytdlp_download(url, dest_folder, status_msg):
-    out_tpl = str(dest_folder / "%(title)s.%(ext)s")
-    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    
-    process = await asyncio.create_subprocess_exec(
-        "yt-dlp", "-o", out_tpl, "--merge-output-format", "mp4", "--newline", 
-        "--user-agent", ua, url,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-
-    while True:
-        line = await process.stdout.readline()
-        if not line: break
-        
-        line_decoded = line.decode().strip()
-        match = re.search(r"(\d+(?:\.\d+)?)%", line_decoded)
-        if match:
-            try:
-                percent = float(match.group(1))
-                await progress_bar(percent, 100, status_msg, "⬇️ YT-DLP Downloading", is_percentage=True)
-            except: pass
-
-    await process.wait()
-    return process.returncode == 0
-
-# ---------------- HANDLERS ----------------
-
-async def safe_upload_video(client, file_path, thumb_path, caption, status_msg):
-    try:
-        if os.path.getsize(file_path) < 1024:
-            log.warning(f"File too small, skipping: {file_path}")
-            return
-
-        # Uploads to "me" (Saved Messages) so it's private to the userbot owner
-        await client.send_video(
-            "me", 
-            video=file_path, 
-            caption=caption, 
-            thumb=thumb_path, 
-            supports_streaming=True,
-            progress=progress_bar, 
-            progress_args=(status_msg, "⬆️ Uploading")
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", src, "-ss", "00:00:01", "-vframes", "1", thumb],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
         )
-    except Exception as e:
-        log.error(f"Upload Error: {e}")
-        await status_msg.edit(f"❌ Upload Failed: {str(e)[:50]}")
+        if os.path.exists(thumb):
+            return thumb
+    except:
+        pass
+    return None
 
-async def handle_ytdlp(client, status, url, download_path):
-    success = await ytdlp_download(url, download_path, status)
-    if not success:
-        return await status.edit("❌ YT-DLP Download Failed.")
-    
-    files_found = list(download_path.glob("*"))
-    if not files_found: return await status.edit("❌ No files found.")
+def normalize_path(p):
+    return str(p.dest) if hasattr(p, "dest") else str(p)
 
-    for f in files_found:
-        if f.suffix.lower() in [".mp4", ".mkv", ".mov", ".webm"]:
-            fixed = await faststart_mp4(str(f))
-            thumb = await make_thumb(fixed)
-            await safe_upload_video(client, fixed, thumb, f.name, status)
-            for x in [fixed, thumb]:
-                if x and os.path.exists(str(x)): os.remove(str(x))
+# ---------------- SMART DOWNLOAD ----------------
 
-async def handle_direct(client, status, url, download_path, custom_filename=None):
-    if custom_filename:
-        file_name = sanitize_filename(custom_filename)
-    else:
-        raw_name = url.split("/")[-1].split("?")[0]
-        file_name = sanitize_filename(unquote(raw_name) if raw_name else "video.mp4")
-    
-    if "." not in file_name: file_name += ".mp4"
-    dest_path = download_path / file_name
-    
-    success = await download_file(url, dest_path, status)
-    if not success: return await status.edit(f"❌ Failed to download.")
+async def smart_download(url):
+    # 1. Pixeldrain List (Album)
+    m = re.search(r"pixeldrain\.com/l/(\w+)", url)
+    if m:
+        try:
+            r = requests.get(f"https://pixeldrain.com/api/list/{m.group(1)}").json()
+            files = []
+            for idx, f in enumerate(r.get("files", []), 1):
+                # Clean filename
+                safe_name = re.sub(r'[\\/*?:"<>|]', "", f['name'])
+                out = DOWNLOAD_DIR / f"{idx}_{safe_name}"
+                
+                # Use API URL
+                api_url = f"https://pixeldrain.com/api/file/{f['id']}"
+                subprocess.run(
+                    ["aria2c", "-x", "4", "-k", "1M", "-o", str(out), api_url],
+                    check=True
+                )
+                files.append(out)
+            return files
+        except Exception as e:
+            log.error(f"Pixeldrain List Error: {e}")
+            return []
 
-    fixed = await faststart_mp4(str(dest_path))
-    thumb = await make_thumb(fixed)
-    
-    await safe_upload_video(client, fixed, thumb, file_name, status)
-
-    for f in [fixed, thumb]:
-        if f and os.path.exists(str(f)): os.remove(str(f))
-
-async def handle_pixeldrain(client, status, url, download_path):
-    await status.edit("Pixeldrain: Processing...")
-    match = re.search(r"pixeldrain\.com/u/([a-zA-Z0-9]+)", url)
-    if not match: return await status.edit("❌ Invalid Pixeldrain URL.")
-    
-    file_id = match.group(1)
-    direct_url = f"https://pixeldrain.com/api/file/{file_id}"
-    await handle_direct(client, status, direct_url, download_path, custom_filename=f"{file_id}.mp4")
-
-async def handle_gofile(client, status, content_id, download_path):
-    go = GoFile()
-    files = go.get_files(dir=str(download_path), content_id=content_id)
-    if not files: return await status.edit("GoFile: No files found.")
-
-    for idx, file in enumerate(files, 1):
-        file_name = os.path.basename(file.dest)
-        await status.edit(f"⬇️ GoFile: Downloading {file_name}...")
+    # 2. Pixeldrain Single File
+    m = re.search(r"pixeldrain\.com/u/(\w+)", url)
+    if m:
+        file_id = m.group(1)
+        api_url = f"https://pixeldrain.com/api/file/{file_id}"
         
-        await asyncio.to_thread(Downloader(token=go.token).download, file, 1, lambda *a: None)
-        
-        fixed = await faststart_mp4(file.dest)
-        thumb = await make_thumb(fixed)
-        await safe_upload_video(client, fixed, thumb, file_name, status)
-        
-        if os.path.exists(fixed): os.remove(fixed)
-        if thumb and os.path.exists(thumb): os.remove(thumb)
+        # Try to get real filename via API, fallback to ID.mp4
+        try:
+            info = requests.get(f"https://pixeldrain.com/api/file/{file_id}/info").json()
+            filename = re.sub(r'[\\/*?:"<>|]', "", info.get("name", f"{file_id}.mp4"))
+        except:
+            filename = f"{file_id}.mp4"
 
-# ---------------- MAIN ROUTER ----------------
+        out = DOWNLOAD_DIR / filename
+        
+        # Use fewer connections (-x 4) for Pixeldrain to avoid dropping
+        subprocess.run(
+            ["aria2c", "-x", "4", "-k", "1M", "-o", str(filename), "-d", str(DOWNLOAD_DIR), api_url],
+            check=True
+        )
+        return [out]
 
-# CHANGED: Use filters.me to behave like a Userbot (Only responds to YOU)
-@app.on_message(filters.me & filters.text & ~filters.forwarded)
-async def main_handler(client, message: Message):
+    # 3. Direct Links (MP4/MOV)
+    if re.search(r"\.(mp4|mov|mkv)(\?|$)", url):
+        try:
+            # Try aria2c first for speed
+            out_name = "direct_video.mp4"
+            subprocess.run(
+                ["aria2c", "-x", "8", "-s", "8", "-k", "1M", "-d", str(DOWNLOAD_DIR), url],
+                check=True
+            )
+            return list(DOWNLOAD_DIR.glob("*"))
+        except subprocess.CalledProcessError:
+            # Fallback to yt-dlp if aria2c fails (e.g. headers required)
+            pass
+
+    # 4. Generic yt-dlp (YouTube, etc)
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--merge-output-format", "mp4",
+        "-o", str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
+        url
+    ]
+    subprocess.run(cmd, check=True)
+    return list(DOWNLOAD_DIR.glob("*"))
+
+# ---------------- handler ----------------
+
+@app.on_message(filters.text & (filters.outgoing | filters.private))
+async def handler(client, message: Message):
     text = message.text.strip()
     if not text.startswith("http"): return
-    
-    try:
-        if get_free_space() < MIN_FREE_SPACE_MB * 1024 * 1024:
-            return await message.reply("⚠️ Disk Full (Free space < 400MB).")
-    except: pass 
 
-    status = await message.reply("⏳ Userbot Processing...")
-    
-    unique_dir = BASE_OUTPUT_DIR / str(message.id)
-    shutil.rmtree(unique_dir, ignore_errors=True)
-    unique_dir.mkdir(parents=True, exist_ok=True)
+    if get_free_space() < MIN_FREE_SPACE_MB * 1024 * 1024:
+        return await message.reply("Disk Full.")
+
+    status = await message.reply("Starting...")
+    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
-        if "gofile.io/d/" in text:
-            content_id = text.split("/")[-1]
-            await handle_gofile(client, status, content_id, unique_dir)
-        elif "pixeldrain.com" in text:
-            await handle_pixeldrain(client, status, text, unique_dir)
-        elif any(x in text for x in ["youtube", "twitter", "instagram", "youtu.be", "tiktok"]):
-            await handle_ytdlp(client, status, text, unique_dir)
+        # --- GOFILE HANDLER ---
+        m = re.search(r"gofile\.io/d/([\w\-]+)", text)
+        if m:
+            go = GoFile()
+            files = go.get_files(dir=str(DOWNLOAD_DIR), content_id=m.group(1))
+
+            for idx, f in enumerate(files, 1):
+                file_name = os.path.basename(f.dest)
+                real_path = normalize_path(f)
+                
+                # FIXED: Don't calculate size here, file doesn't exist yet!
+                
+                upload_queue = asyncio.Queue()
+                download_done = asyncio.Event()
+                loop = asyncio.get_running_loop()
+
+                def on_part(path, part, total, size):
+                    asyncio.run_coroutine_threadsafe(upload_queue.put((path, part, total)), loop)
+
+                async def download_task():
+                    try:
+                        await asyncio.to_thread(Downloader(token=go.token).download, f, 1, on_part)
+                    finally:
+                        download_done.set()
+
+                async def upload_task():
+                    while True:
+                        get_task = asyncio.create_task(upload_queue.get())
+                        wait_task = asyncio.create_task(download_done.wait())
+                        done_set, pending = await asyncio.wait([get_task, wait_task], return_when=asyncio.FIRST_COMPLETED)
+
+                        if get_task in done_set:
+                            path, part_num, total_parts = await get_task
+                            if wait_task in pending: wait_task.cancel()
+                            
+                            # Wait briefly for IO buffers to flush
+                            await asyncio.sleep(0.5)
+                            
+                            if not os.path.exists(path): continue
+                            
+                            # NOW it is safe to check size
+                            current_file_size = os.path.getsize(path)
+                            parts = max(1, math.ceil(current_file_size / MAX_PART_SIZE))
+
+                            # Split manually into chunks if bigger
+                            if parts > 1:
+                                for i in range(parts):
+                                    start = i * MAX_PART_SIZE
+                                    end = min(start + MAX_PART_SIZE, current_file_size)
+                                    chunk_path = f"{path}.part{i+1}"
+                                    
+                                    with open(path, "rb") as src, open(chunk_path, "wb") as dst:
+                                        src.seek(start)
+                                        dst.write(src.read(end - start))
+
+                                    fixed = faststart_mp4(chunk_path)
+                                    thumb = make_thumb(fixed)
+                                    caption = f"{file_name} [Part {i+1}/{parts}]"
+
+                                    try:
+                                        await client.send_video(
+                                            "me",
+                                            fixed,
+                                            caption=caption,
+                                            supports_streaming=True,
+                                            thumb=thumb,
+                                            progress=progress_bar,
+                                            progress_args=(status,f"[{idx}/{len(files)}] Uploading {i+1}/{parts}")
+                                        )
+                                    except Exception as e:
+                                        log.error(f"Upload failed: {e}")
+
+                                    if os.path.exists(chunk_path): os.remove(chunk_path)
+                                    if fixed != chunk_path and os.path.exists(fixed): os.remove(fixed)
+                            else:
+                                fixed = faststart_mp4(path)
+                                thumb = make_thumb(fixed)
+                                try:
+                                    await client.send_video(
+                                        "me",
+                                        fixed,
+                                        caption=file_name,
+                                        supports_streaming=True,
+                                        thumb=thumb,
+                                        progress=progress_bar,
+                                        progress_args=(status,f"[{idx}/{len(files)}] Uploading")
+                                    )
+                                except Exception as e:
+                                    log.error(f"Upload failed: {e}")
+
+                                if os.path.exists(path): os.remove(path)
+                                if fixed != path and os.path.exists(fixed): os.remove(fixed)
+
+                        else:
+                            if get_task in pending: get_task.cancel()
+                            if upload_queue.empty(): break
+
+                await asyncio.gather(download_task(), upload_task())
+
+        # --- SMART DOWNLOAD HANDLER ---
         else:
-            await handle_direct(client, status, text, unique_dir)
-            
-        await status.edit("✅ Download Complete.")
+            await status.edit("Downloading...")
+            files = await smart_download(text)
+
+            if not files:
+                await status.edit("No files found or download failed.")
+                return
+
+            for idx, f in enumerate(files, 1):
+                f_path = str(f)
+                if not os.path.exists(f_path): continue
+                
+                file_name = os.path.basename(f_path)
+                fixed = faststart_mp4(f_path)
+                
+                # Check size for splitting
+                file_size = os.path.getsize(fixed)
+                parts = max(1, math.ceil(file_size / MAX_PART_SIZE))
+                
+                thumb = make_thumb(fixed)
+
+                if parts > 1:
+                    for i in range(parts):
+                        start = i * MAX_PART_SIZE
+                        end = min(start + MAX_PART_SIZE, file_size)
+                        chunk_path = f"{fixed}.part{i+1}"
+                        
+                        with open(fixed, "rb") as src, open(chunk_path, "wb") as dst:
+                            src.seek(start)
+                            dst.write(src.read(end - start))
+
+                        # Faststart the chunk too (helps telegram stream it)
+                        fixed_chunk = faststart_mp4(chunk_path)
+                        thumb_chunk = make_thumb(fixed_chunk)
+                        caption = f"{file_name} [Part {i+1}/{parts}]"
+
+                        await client.send_video(
+                            "me",
+                            fixed_chunk,
+                            caption=caption,
+                            supports_streaming=True,
+                            thumb=thumb_chunk,
+                            progress=progress_bar,
+                            progress_args=(status,f"Uploading {i+1}/{parts}")
+                        )
+                        
+                        if os.path.exists(chunk_path): os.remove(chunk_path)
+                        if fixed_chunk != chunk_path and os.path.exists(fixed_chunk): os.remove(fixed_chunk)
+                        if thumb_chunk: os.remove(thumb_chunk)
+                else:
+                    await client.send_video(
+                        "me",
+                        fixed,
+                        caption=file_name,
+                        supports_streaming=True,
+                        thumb=thumb,
+                        progress=progress_bar,
+                        progress_args=(status,"Uploading")
+                    )
+
+                if os.path.exists(f_path): os.remove(f_path)
+                if fixed != f_path and os.path.exists(fixed): os.remove(fixed)
+                if thumb: os.remove(thumb)
+
+        await status.edit("All done!")
+
     except Exception as e:
         log.exception(e)
-        await status.edit(f"❌ Error: {str(e)[:150]}")
-    finally:
-        try:
-            shutil.rmtree(unique_dir, ignore_errors=True)
-        except: pass
+        await status.edit(f"Error: {str(e)[:100]}")
+
+    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
 
 if __name__ == "__main__":
-    if not API_ID:
-        print("❌ Error: API_ID missing.")
-    else:
-        print("✅ Userbot Started...")
-        app.run()
+    app.run()
