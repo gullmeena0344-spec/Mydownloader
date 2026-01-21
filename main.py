@@ -61,6 +61,25 @@ async def progress_bar(current, total, status_msg, action_name):
     except Exception as e:
         log.debug(f"Progress update error: {e}")
 
+# ✅ ADDED (only for thumbnail + streaming fix)
+def faststart_mp4(src):
+    dst = src + ".fast.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", dst],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    return dst
+
+def make_thumb(src):
+    thumb = src + ".jpg"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", src, "-ss", "00:00:01", "-vframes", "1", thumb],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    return thumb if os.path.exists(thumb) else None
+
 @app.on_message(filters.text & (filters.outgoing | filters.private))
 async def handler(client, message: Message):
     m = re.search(r"gofile\.io/d/([\w\-]+)", message.text)
@@ -95,10 +114,8 @@ async def handler(client, message: Message):
             upload_queue = asyncio.Queue()
             download_complete = asyncio.Event()
 
-            # ✅ FIX: capture running loop
             loop = asyncio.get_running_loop()
 
-            # ✅ FIX: use captured loop (no asyncio_0 error)
             def on_part_ready(path, part_num, total_parts, size):
                 asyncio.run_coroutine_threadsafe(
                     upload_queue.put((path, part_num, total_parts)),
@@ -145,12 +162,17 @@ async def handler(client, message: Message):
                                 f"[{idx}/{len(files)}] Uploading part {part_num}/{total_parts}..."
                             )
 
+                            # ✅ REPLACED ONLY THIS PART
+                            fixed = faststart_mp4(str(path))
+                            thumb = make_thumb(fixed)
+
                             try:
                                 await client.send_video(
                                     "me",
-                                    video=str(path),
+                                    video=fixed,
                                     caption=caption,
                                     supports_streaming=True,
+                                    thumb=thumb,
                                     progress=progress_bar,
                                     progress_args=(
                                         status,
@@ -160,10 +182,12 @@ async def handler(client, message: Message):
                             except Exception as send_err:
                                 log.error(f"Send error: {send_err}")
 
-                            try:
-                                os.remove(path)
-                            except:
-                                pass
+                            for f in (path, fixed, thumb):
+                                try:
+                                    if f and os.path.exists(f):
+                                        os.remove(f)
+                                except:
+                                    pass
                         else:
                             if get_task in pending:
                                 get_task.cancel()
