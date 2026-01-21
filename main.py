@@ -41,20 +41,25 @@ def format_bytes(size):
             return f"{size:.2f} {unit}"
         size /= 1024
 
+def get_progress_bar(percent, total=20):
+    filled = int(total * percent // 100)
+    bar = "█" * filled + "░" * (total - filled)
+    return f"[{bar}] {percent:.1f}%"
+
 async def progress_bar(current, total, status_msg, action_name):
     try:
         now = time.time()
-        if hasattr(status_msg, "last_update") and (now - status_msg.last_update) < 4:
+        if hasattr(status_msg, "last_update") and (now - status_msg.last_update) < 2:
             return
         status_msg.last_update = now
         perc = current * 100 / total
+        bar = get_progress_bar(perc)
         await status_msg.edit(
-            f"{action_name}...\n"
-            f"Progress: {perc:.1f}%\n"
+            f"{action_name}\n{bar}\n"
             f"{format_bytes(current)} / {format_bytes(total)}"
         )
-    except:
-        pass
+    except Exception as e:
+        log.debug(f"Progress update error: {e}")
 
 @app.on_message(filters.text & (filters.outgoing | filters.private))
 async def handler(client, message: Message):
@@ -106,6 +111,7 @@ async def handler(client, message: Message):
                     )
                 except Exception as e:
                     log.error(f"Download error: {e}")
+                    await status.edit(f"Download failed: {str(e)[:50]}")
                 finally:
                     download_complete.set()
 
@@ -125,23 +131,41 @@ async def handler(client, message: Message):
                             if wait_task in pending:
                                 wait_task.cancel()
 
+                            if not os.path.exists(path):
+                                log.error(f"File not found: {path}")
+                                continue
+
                             caption = f"{file_name}"
                             if total_parts > 1:
                                 caption = f"{file_name} [Part {part_num}/{total_parts}]"
 
                             await status.edit(f"[{idx}/{len(files)}] Uploading part {part_num}/{total_parts}...")
 
-                            await client.send_video(
-                                "me",
-                                video=str(path),
-                                caption=caption,
-                                supports_streaming=True,
-                                progress=progress_bar,
-                                progress_args=(status, f"Uploading {part_num}/{total_parts}")
-                            )
+                            try:
+                                result = await client.send_video(
+                                    "me",
+                                    video=str(path),
+                                    caption=caption,
+                                    supports_streaming=True,
+                                    progress=progress_bar,
+                                    progress_args=(status, f"[{idx}/{len(files)}] Uploading {part_num}/{total_parts}")
+                                )
 
-                            os.remove(path)
-                            uploaded += 1
+                                if result:
+                                    log.info(f"Video sent successfully: {file_name} Part {part_num}/{total_parts}")
+                                    uploaded += 1
+                                else:
+                                    log.error(f"Failed to send video: {path}")
+                                    await status.edit(f"Failed to send: {file_name} part {part_num}")
+
+                            except Exception as send_err:
+                                log.error(f"Send error: {send_err}")
+                                await status.edit(f"Send failed: {str(send_err)[:50]}")
+
+                            try:
+                                os.remove(path)
+                            except:
+                                pass
 
                         else:
                             if get_task in pending:
@@ -152,15 +176,15 @@ async def handler(client, message: Message):
                     except asyncio.CancelledError:
                         break
                     except Exception as e:
-                        log.error(f"Upload error: {e}")
+                        log.error(f"Upload task error: {e}")
 
             await asyncio.gather(download_task(), upload_task())
 
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-        await status.edit("Done")
+        await status.edit("All done!")
 
     except Exception as e:
-        log.error(f"Error: {e}")
+        log.error(f"Handler error: {e}")
         await status.edit(f"Error: {str(e)[:100]}")
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
 
