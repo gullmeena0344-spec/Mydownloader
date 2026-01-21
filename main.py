@@ -10,10 +10,11 @@ from urllib.parse import unquote
 from pathlib import Path
 from pyrogram import Client, filters
 from pyrogram.types import Message
-# Assuming run.py is in the same folder and works correctly
 from run import GoFile, Downloader
 
 # --- Config ---
+# Userbots need API_ID and SESSION_STRING. 
+# API_HASH is required for login.
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 SESSION_STRING = os.getenv("SESSION_STRING", "")
@@ -22,10 +23,11 @@ BASE_OUTPUT_DIR = Path("output")
 MIN_FREE_SPACE_MB = 400
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    format="[%(levelname)s] %(asctime)s - %(message)s",
+    level=logging.INFO,
+    handlers=[logging.StreamHandler()]
 )
-log = logging.getLogger("BOT")
+log = logging.getLogger("USERBOT")
 
 app = Client("gofile-userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 
@@ -41,8 +43,6 @@ def format_bytes(size):
     return f"{size:.2f} TB"
 
 def sanitize_filename(name):
-    """Removes illegal characters from filenames."""
-    # Remove null bytes, illegal chars for Windows/Linux
     name = re.sub(r'[<>:"/\\|?*]', '', name)
     name = name.strip()
     return name if name else "video.mp4"
@@ -55,12 +55,10 @@ def get_progress_bar(percent, total=20):
 async def progress_bar(current, total, status_msg, action_name, is_percentage=False):
     try:
         now = time.time()
-        # Initialize last_update
         if not hasattr(status_msg, "last_update"):
             status_msg.last_update = 0
         
-        # 2.5s delay to prevent FloodWait
-        if (now - status_msg.last_update) < 2.5: 
+        if (now - status_msg.last_update) < 3: 
             return
 
         status_msg.last_update = now
@@ -76,14 +74,14 @@ async def progress_bar(current, total, status_msg, action_name, is_percentage=Fa
     except Exception: 
         pass
 
-# ---------------- MEDIA PROCESSING (Threaded) ----------------
+# ---------------- MEDIA PROCESSING ----------------
 
 def get_video_duration(src):
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", 
              "-of", "default=noprint_wrappers=1:nokey=1", src],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15
         )
         return float(result.stdout.strip())
     except: return 0.0
@@ -92,10 +90,6 @@ def _make_thumb_sync(src):
     thumb_path = src + ".jpg"
     duration = get_video_duration(src)
     
-    # Logic: 
-    # > 5s: take at 20%
-    # 0-5s: take at 1s
-    # 0s (Metadata fail): take at 0s
     if duration > 5:
         seek_time = str(int(duration * 0.20))
     elif duration > 0:
@@ -104,7 +98,6 @@ def _make_thumb_sync(src):
         seek_time = "00:00:00"
 
     try:
-        # scale=320:-1 is CRITICAL for Telegram thumbnails
         cmd = ["ffmpeg", "-y", "-ss", seek_time, "-i", src, "-vframes", "1", 
                "-vf", "scale=320:-1", "-q:v", "5", thumb_path]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
@@ -116,7 +109,6 @@ def _make_thumb_sync(src):
 def _faststart_sync(src):
     dst = src + ".fast.mp4"
     try:
-        # -movflags +faststart optimizes MP4 for streaming
         subprocess.run(["ffmpeg", "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", dst],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         if os.path.exists(dst) and os.path.getsize(dst) > 0:
@@ -133,7 +125,6 @@ async def faststart_mp4(src):
 
 # ---------------- DOWNLOAD HELPERS ----------------
 
-# 1. AIOHTTP Downloader
 async def download_file(url, dest_path, status_msg):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
@@ -162,11 +153,8 @@ async def download_file(url, dest_path, status_msg):
         log.error(f"Download Exception: {e}")
         return False
 
-# 2. YT-DLP Downloader
 async def ytdlp_download(url, dest_folder, status_msg):
     out_tpl = str(dest_folder / "%(title)s.%(ext)s")
-    
-    # Add User-Agent to prevent blocks
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     
     process = await asyncio.create_subprocess_exec(
@@ -181,7 +169,7 @@ async def ytdlp_download(url, dest_folder, status_msg):
         if not line: break
         
         line_decoded = line.decode().strip()
-        match = re.search(r"(\d+\.\d+)%", line_decoded)
+        match = re.search(r"(\d+(?:\.\d+)?)%", line_decoded)
         if match:
             try:
                 percent = float(match.group(1))
@@ -192,6 +180,26 @@ async def ytdlp_download(url, dest_folder, status_msg):
     return process.returncode == 0
 
 # ---------------- HANDLERS ----------------
+
+async def safe_upload_video(client, file_path, thumb_path, caption, status_msg):
+    try:
+        if os.path.getsize(file_path) < 1024:
+            log.warning(f"File too small, skipping: {file_path}")
+            return
+
+        # Uploads to "me" (Saved Messages) so it's private to the userbot owner
+        await client.send_video(
+            "me", 
+            video=file_path, 
+            caption=caption, 
+            thumb=thumb_path, 
+            supports_streaming=True,
+            progress=progress_bar, 
+            progress_args=(status_msg, "⬆️ Uploading")
+        )
+    except Exception as e:
+        log.error(f"Upload Error: {e}")
+        await status_msg.edit(f"❌ Upload Failed: {str(e)[:50]}")
 
 async def handle_ytdlp(client, status, url, download_path):
     success = await ytdlp_download(url, download_path, status)
@@ -205,11 +213,7 @@ async def handle_ytdlp(client, status, url, download_path):
         if f.suffix.lower() in [".mp4", ".mkv", ".mov", ".webm"]:
             fixed = await faststart_mp4(str(f))
             thumb = await make_thumb(fixed)
-            try:
-                await client.send_video("me", video=fixed, caption=f.name, thumb=thumb, supports_streaming=True,
-                                     progress=progress_bar, progress_args=(status, "⬆️ Uploading Video"))
-            except Exception as e: log.error(f"Upload fail: {e}")
-            
+            await safe_upload_video(client, fixed, thumb, f.name, status)
             for x in [fixed, thumb]:
                 if x and os.path.exists(str(x)): os.remove(str(x))
 
@@ -220,21 +224,16 @@ async def handle_direct(client, status, url, download_path, custom_filename=None
         raw_name = url.split("/")[-1].split("?")[0]
         file_name = sanitize_filename(unquote(raw_name) if raw_name else "video.mp4")
     
+    if "." not in file_name: file_name += ".mp4"
     dest_path = download_path / file_name
     
     success = await download_file(url, dest_path, status)
-    if not success:
-        return await status.edit(f"❌ Failed to download.")
+    if not success: return await status.edit(f"❌ Failed to download.")
 
     fixed = await faststart_mp4(str(dest_path))
     thumb = await make_thumb(fixed)
     
-    try:
-        await client.send_video("me", video=fixed, caption=file_name, thumb=thumb, supports_streaming=True,
-                                progress=progress_bar, progress_args=(status, "⬆️ Uploading File"))
-    except Exception as e:
-        log.error(f"Upload Error: {e}")
-        await status.edit(f"❌ Upload Error: {e}")
+    await safe_upload_video(client, fixed, thumb, file_name, status)
 
     for f in [fixed, thumb]:
         if f and os.path.exists(str(f)): os.remove(str(f))
@@ -261,27 +260,25 @@ async def handle_gofile(client, status, content_id, download_path):
         
         fixed = await faststart_mp4(file.dest)
         thumb = await make_thumb(fixed)
+        await safe_upload_video(client, fixed, thumb, file_name, status)
         
-        try:
-            await client.send_video("me", video=fixed, caption=file_name, thumb=thumb, supports_streaming=True,
-                                    progress=progress_bar, progress_args=(status, "⬆️ Uploading Video"))
-        except Exception as e:
-            log.error(f"GoFile Upload Error: {e}")
-            
         if os.path.exists(fixed): os.remove(fixed)
         if thumb and os.path.exists(thumb): os.remove(thumb)
 
 # ---------------- MAIN ROUTER ----------------
 
-@app.on_message(filters.text & (filters.outgoing | filters.private))
+# CHANGED: Use filters.me to behave like a Userbot (Only responds to YOU)
+@app.on_message(filters.me & filters.text & ~filters.forwarded)
 async def main_handler(client, message: Message):
     text = message.text.strip()
     if not text.startswith("http"): return
     
-    if get_free_space() < MIN_FREE_SPACE_MB * 1024 * 1024:
-        return await message.reply("Disk Full.")
+    try:
+        if get_free_space() < MIN_FREE_SPACE_MB * 1024 * 1024:
+            return await message.reply("⚠️ Disk Full (Free space < 400MB).")
+    except: pass 
 
-    status = await message.reply("⏳ Connecting...")
+    status = await message.reply("⏳ Userbot Processing...")
     
     unique_dir = BASE_OUTPUT_DIR / str(message.id)
     shutil.rmtree(unique_dir, ignore_errors=True)
@@ -298,7 +295,7 @@ async def main_handler(client, message: Message):
         else:
             await handle_direct(client, status, text, unique_dir)
             
-        await status.edit("✅ Job Finished.")
+        await status.edit("✅ Download Complete.")
     except Exception as e:
         log.exception(e)
         await status.edit(f"❌ Error: {str(e)[:150]}")
@@ -311,4 +308,5 @@ if __name__ == "__main__":
     if not API_ID:
         print("❌ Error: API_ID missing.")
     else:
+        print("✅ Userbot Started...")
         app.run()
