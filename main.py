@@ -1,5 +1,6 @@
 import os
 import re
+import math
 import asyncio
 import shutil
 import time
@@ -19,6 +20,7 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 DOWNLOAD_DIR = Path("output")
 MAX_TG_SIZE = 1990 * 1024 * 1024
 MIN_FREE_SPACE_MB = 500
+MAX_PART_SIZE = 1600 * 1024 * 1024  # 1.6 GB per part
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("BOT")
@@ -56,8 +58,6 @@ async def progress_bar(current, total, status, title):
         f"{format_bytes(current)} / {format_bytes(total)}"
     )
 
-# ---------------- fixes applied ----------------
-
 def faststart_mp4(src):
     dst = src + ".fast.mp4"
     subprocess.run(
@@ -69,12 +69,18 @@ def faststart_mp4(src):
 
 def make_thumb(src):
     thumb = src + ".jpg"
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", src, "-ss", "00:00:01", "-vframes", "1", thumb],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-    return thumb if os.path.exists(thumb) else None
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", src, "-ss", "00:00:01", "-vframes", "1", thumb],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True
+        )
+        if os.path.exists(thumb):
+            return thumb
+    except:
+        pass
+    return None
 
 def normalize_path(p):
     return str(p.dest) if hasattr(p, "dest") else str(p)
@@ -152,8 +158,12 @@ async def handler(client, message: Message):
             go = GoFile()
             files = go.get_files(dir=str(DOWNLOAD_DIR), content_id=m.group(1))
 
-            for idx, f in enumerate(files,1):
+            for idx, f in enumerate(files, 1):
                 file_name = os.path.basename(f.dest)
+                real_path = normalize_path(f)
+                file_size = os.path.getsize(real_path)
+                parts = max(1, math.ceil(file_size / MAX_PART_SIZE))
+
                 upload_queue = asyncio.Queue()
                 download_done = asyncio.Event()
                 loop = asyncio.get_running_loop()
@@ -163,7 +173,7 @@ async def handler(client, message: Message):
 
                 async def download_task():
                     try:
-                        await asyncio.to_thread(Downloader(token=go.token).download,f,1,on_part)
+                        await asyncio.to_thread(Downloader(token=go.token).download, f, 1, on_part)
                     finally:
                         download_done.set()
 
@@ -174,28 +184,48 @@ async def handler(client, message: Message):
                         done_set, pending = await asyncio.wait([get_task, wait_task], return_when=asyncio.FIRST_COMPLETED)
 
                         if get_task in done_set:
-                            path, part, total = await get_task
+                            path, part_num, total_parts = await get_task
                             if wait_task in pending: wait_task.cancel()
                             if not os.path.exists(path): continue
-                            caption = file_name if total==1 else f"{file_name} [Part {part}/{total}]"
-                            await status.edit(f"[{idx}/{len(files)}] Uploading {part}/{total}...")
-                            fixed = faststart_mp4(str(path))
-                            thumb = make_thumb(fixed)
-                            try:
+
+                            # Split manually into 1.6GB chunks if bigger
+                            if parts > 1:
+                                for i in range(parts):
+                                    start = i * MAX_PART_SIZE
+                                    end = min(start + MAX_PART_SIZE, file_size)
+                                    chunk_path = f"{real_path}.part{i+1}"
+                                    with open(real_path, "rb") as src, open(chunk_path, "wb") as dst:
+                                        src.seek(start)
+                                        dst.write(src.read(end - start))
+
+                                    fixed = faststart_mp4(chunk_path)
+                                    thumb = make_thumb(fixed)  # always generate thumbnail for each part
+                                    caption = f"{file_name} [Part {i+1}/{parts}]"
+
+                                    await client.send_video(
+                                        "me",
+                                        fixed,
+                                        caption=caption,
+                                        supports_streaming=True,
+                                        thumb=thumb,
+                                        progress=progress_bar,
+                                        progress_args=(status,f"[{idx}/{len(files)}] Uploading {i+1}/{parts}")
+                                    )
+                                    os.remove(chunk_path)
+                            else:
+                                fixed = faststart_mp4(real_path)
+                                thumb = make_thumb(fixed)
                                 await client.send_video(
                                     "me",
                                     fixed,
-                                    caption=caption,
+                                    caption=file_name,
                                     supports_streaming=True,
                                     thumb=thumb,
                                     progress=progress_bar,
-                                    progress_args=(status,f"[{idx}/{len(files)}] Uploading {part}/{total}")
+                                    progress_args=(status,f"[{idx}/{len(files)}] Uploading")
                                 )
-                            except Exception as send_err:
-                                log.error(f"Send error: {send_err}")
-                            for x in (path,fixed,thumb):
-                                try: os.remove(x)
-                                except: pass
+                                os.remove(real_path)
+
                         else:
                             if get_task in pending: get_task.cancel()
                             if upload_queue.empty(): break
@@ -206,21 +236,48 @@ async def handler(client, message: Message):
             await status.edit("Downloading...")
             files = await smart_download(text)
 
-            for idx, f in enumerate(files,1):
+            for idx, f in enumerate(files, 1):
                 fixed = faststart_mp4(str(f))
                 thumb = make_thumb(fixed)
-                await client.send_video(
-                    "me",
-                    fixed,
-                    caption=f.name,
-                    supports_streaming=True,
-                    thumb=thumb,
-                    progress=progress_bar,
-                    progress_args=(status,"Uploading")
-                )
-                for x in (f,fixed,thumb):
-                    try: os.remove(x)
-                    except: pass
+                # split large files
+                file_size = os.path.getsize(f)
+                parts = max(1, math.ceil(file_size / MAX_PART_SIZE))
+                if parts > 1:
+                    for i in range(parts):
+                        start = i * MAX_PART_SIZE
+                        end = min(start + MAX_PART_SIZE, file_size)
+                        chunk_path = f"{f}.part{i+1}"
+                        with open(f, "rb") as src, open(chunk_path, "wb") as dst:
+                            src.seek(start)
+                            dst.write(src.read(end - start))
+
+                        fixed_chunk = faststart_mp4(chunk_path)
+                        thumb_chunk = make_thumb(fixed_chunk)
+                        caption = f"{f.name} [Part {i+1}/{parts}]"
+
+                        await client.send_video(
+                            "me",
+                            fixed_chunk,
+                            caption=caption,
+                            supports_streaming=True,
+                            thumb=thumb_chunk,
+                            progress=progress_bar,
+                            progress_args=(status,f"Uploading {i+1}/{parts}")
+                        )
+                        os.remove(chunk_path)
+                else:
+                    await client.send_video(
+                        "me",
+                        fixed,
+                        caption=f.name,
+                        supports_streaming=True,
+                        thumb=thumb,
+                        progress=progress_bar,
+                        progress_args=(status,"Uploading")
+                    )
+                os.remove(f)
+                os.remove(fixed)
+                if thumb: os.remove(thumb)
 
         await status.edit("All done!")
 
