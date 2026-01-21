@@ -79,7 +79,7 @@ class Downloader:
         try:
             total_size, is_support_range = self._get_total_size(link)
 
-            part_size = 2 * 1024 * 1024 * 1024  # 2GB
+            part_size = 1500 * 1024 * 1024 * 1024  # 2GB
             needs_splitting = total_size > part_size
 
             display_name = os.path.basename(dest)
