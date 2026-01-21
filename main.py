@@ -7,10 +7,12 @@ import time
 import logging
 import subprocess
 from pathlib import Path
+from queue import Queue
+from threading import Thread
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from run import GoFile
+from run import GoFile, Downloader, File
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
@@ -18,7 +20,7 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 
 DOWNLOAD_DIR = Path("output")
 MAX_TG_SIZE = 1990 * 1024 * 1024
-MIN_FREE_SPACE_MB = 300
+MIN_FREE_SPACE_MB = 500
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("BOT")
@@ -61,54 +63,105 @@ async def handler(client, message: Message):
         return
 
     if get_free_space() < MIN_FREE_SPACE_MB * 1024 * 1024:
-        return await message.reply("❌ Disk Full.")
+        return await message.reply("Disk Full.")
 
-    status = await message.reply("⬇️ Starting Download...")
+    status = await message.reply("Starting Download...")
     shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ---- ONLY CHANGE STARTS HERE ----
-    go = GoFile()
-    seen = set()
+    try:
+        go = GoFile()
+        files = go.get_files(dir=str(DOWNLOAD_DIR), content_id=m.group(1))
 
-    def download():
-        go.execute(
-            dir=str(DOWNLOAD_DIR),
-            content_id=m.group(1),
-            num_threads=1
-        )
+        if not files:
+            await status.edit("No files found.")
+            return
 
-    dl_task = asyncio.to_thread(download)
+        await status.edit(f"Found {len(files)} file(s). Processing...")
 
-    async def watch_and_upload():
-        while True:
-            await asyncio.sleep(3)
-            for f in DOWNLOAD_DIR.rglob("*"):
-                if not f.is_file():
-                    continue
-                if f in seen:
-                    continue
-                if f.stat().st_size < 5 * 1024 * 1024:
-                    continue
+        for idx, file in enumerate(files, 1):
+            if get_free_space() < MIN_FREE_SPACE_MB * 1024 * 1024:
+                await status.edit("Disk Full. Stopped.")
+                break
 
-                seen.add(f)
+            file_name = os.path.basename(file.dest)
+            await status.edit(f"[{idx}/{len(files)}] Downloading: {file_name[:30]}...")
 
-                await client.send_document(
-                    "me",
-                    document=str(f),
-                    caption=f.name,
-                    progress=progress_bar,
-                    progress_args=(status, "⬆️ Uploading")
+            upload_queue = asyncio.Queue()
+            download_complete = asyncio.Event()
+
+            def on_part_ready(path, part_num, total_parts, size):
+                asyncio.run_coroutine_threadsafe(
+                    upload_queue.put((path, part_num, total_parts)),
+                    asyncio.get_event_loop()
                 )
 
-                os.remove(f)
+            async def download_task():
+                try:
+                    await asyncio.to_thread(
+                        Downloader(token=go.token).download,
+                        file,
+                        1,
+                        on_part_ready
+                    )
+                except Exception as e:
+                    log.error(f"Download error: {e}")
+                finally:
+                    download_complete.set()
 
-    try:
-        await asyncio.gather(dl_task, watch_and_upload())
-    except:
-        pass
+            async def upload_task():
+                uploaded = 0
+                while True:
+                    try:
+                        get_task = asyncio.create_task(upload_queue.get())
+                        wait_task = asyncio.create_task(download_complete.wait())
+                        done, pending = await asyncio.wait(
+                            [get_task, wait_task],
+                            return_when=asyncio.FIRST_COMPLETED
+                        )
 
-    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-    await status.edit("✅ Done")
+                        if get_task in done:
+                            path, part_num, total_parts = await get_task
+                            if wait_task in pending:
+                                wait_task.cancel()
+
+                            caption = f"{file_name}"
+                            if total_parts > 1:
+                                caption = f"{file_name} [Part {part_num}/{total_parts}]"
+
+                            await status.edit(f"[{idx}/{len(files)}] Uploading part {part_num}/{total_parts}...")
+
+                            await client.send_video(
+                                "me",
+                                video=str(path),
+                                caption=caption,
+                                supports_streaming=True,
+                                progress=progress_bar,
+                                progress_args=(status, f"Uploading {part_num}/{total_parts}")
+                            )
+
+                            os.remove(path)
+                            uploaded += 1
+
+                        else:
+                            if get_task in pending:
+                                get_task.cancel()
+                            if upload_queue.empty():
+                                break
+
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        log.error(f"Upload error: {e}")
+
+            await asyncio.gather(download_task(), upload_task())
+
+        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+        await status.edit("Done")
+
+    except Exception as e:
+        log.error(f"Error: {e}")
+        await status.edit(f"Error: {str(e)[:100]}")
+        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
 
 app.run()

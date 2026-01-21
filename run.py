@@ -54,7 +54,8 @@ class Downloader:
                     if chunk:
                         f.write(chunk)
                         with self.progress_lock:
-                            self.progress_bar.update(len(chunk))
+                            if self.progress_bar:
+                                self.progress_bar.update(len(chunk))
         return i
 
     def _make_streamable(self, src, dst):
@@ -63,9 +64,10 @@ class Downloader:
                 "ffmpeg",
                 "-y",
                 "-i", src,
-                "-map", "0",
-                "-c", "copy",
+                "-c:v", "copy",
+                "-c:a", "copy",
                 "-movflags", "+faststart",
+                "-metadata:s:v:0", "rotate=0",
                 dst
             ],
             stdout=subprocess.DEVNULL,
@@ -73,7 +75,7 @@ class Downloader:
             check=True
         )
 
-    def download(self, file: File, num_threads=1):
+    def download(self, file: File, num_threads=1, on_part_ready=None):
         link = file.link
         dest = file.dest
 
@@ -81,7 +83,7 @@ class Downloader:
             total_size, is_support_range = self._get_total_size(link)
 
             part_size = 2 * 1024 * 1024 * 1024  # 2GB
-            parts = math.ceil(total_size / part_size)
+            needs_splitting = total_size > part_size
 
             display_name = os.path.basename(dest)
             self.progress_bar = tqdm(
@@ -92,18 +94,38 @@ class Downloader:
             )
 
             os.makedirs(os.path.dirname(dest), exist_ok=True)
-            base, _ = os.path.splitext(dest)
+            base, ext = os.path.splitext(dest)
 
-            for i in range(parts):
-                start = i * part_size
-                end = min(start + part_size - 1, total_size - 1)
+            if not needs_splitting:
+                raw_file = f"{base}.raw{ext}"
+                final_file = dest
 
-                raw_part = f"{base}.raw.part{i+1:03d}"
-                final_part = f"{base}.part{i+1:03d}.mp4"
+                self._download_range(link, 0, total_size - 1, raw_file, 0)
 
-                self._download_range(link, start, end, raw_part, i)
-                self._make_streamable(raw_part, final_part)
-                os.remove(raw_part)
+                if ext.lower() in ['.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.m4v']:
+                    self._make_streamable(raw_file, final_file)
+                    os.remove(raw_file)
+                else:
+                    os.rename(raw_file, final_file)
+
+                if on_part_ready:
+                    on_part_ready(final_file, 1, 1, total_size)
+            else:
+                parts = math.ceil(total_size / part_size)
+
+                for i in range(parts):
+                    start = i * part_size
+                    end = min(start + part_size - 1, total_size - 1)
+
+                    raw_part = f"{base}.raw.part{i+1:03d}"
+                    final_part = f"{base}.part{i+1:03d}.mp4"
+
+                    self._download_range(link, start, end, raw_part, i)
+                    self._make_streamable(raw_part, final_part)
+                    os.remove(raw_part)
+
+                    if on_part_ready:
+                        on_part_ready(final_part, i + 1, parts, end - start + 1)
 
             self.progress_bar.close()
 
@@ -111,6 +133,7 @@ class Downloader:
             if self.progress_bar:
                 self.progress_bar.close()
             logger.error(f"failed to download ({e}): {dest} ({link})")
+            raise
 
 
 class GoFileMeta(type):
