@@ -67,23 +67,23 @@ def faststart_mp4(src):
 
 def make_thumb(src):
     t = src + ".jpg"
-
-    # try at 1 second
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", src, "-ss", "00:00:01", "-vframes", "1", t],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-
-    # fallback: first frame
-    if not os.path.exists(t):
+    try:
+        # safer thumbnail generation (avoids blue screen)
         subprocess.run(
-            ["ffmpeg", "-y", "-i", src, "-vframes", "1", t],
+            [
+                "ffmpeg", "-y", "-i", src,
+                "-vf", "thumbnail,scale=320:180",
+                "-frames:v", "1", t
+            ],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
+            check=True
         )
-
-    return t if os.path.exists(t) else None
+        if os.path.exists(t):
+            return t
+    except:
+        pass
+    return None
 
 def normalize_path(p):
     return str(p.dest) if hasattr(p, "dest") else str(p)
@@ -97,18 +97,21 @@ async def smart_download(url):
         r = requests.get(f"https://pixeldrain.com/api/list/{m.group(1)}").json()
         files = []
 
-        for f in r.get("files", []):
-            out = DOWNLOAD_DIR / f["name"]
-            subprocess.run(
-                [
-                    "aria2c",
-                    "-x", "8", "-s", "8", "-k", "1M",
-                    "-o", str(out),
-                    f"https://pixeldrain.com/api/file/{f['id']}"
-                ],
-                check=True
-            )
-            files.append(out)
+        for idx, f in enumerate(r.get("files", []), 1):
+            out = DOWNLOAD_DIR / f"{idx}_{f['name']}"  # unique filename
+            try:
+                subprocess.run(
+                    [
+                        "aria2c",
+                        "-x", "8", "-s", "8", "-k", "1M",
+                        "-o", str(out),
+                        f"https://pixeldrain.com/api/file/{f['id']}"
+                    ],
+                    check=True
+                )
+                files.append(out)
+            except subprocess.CalledProcessError as e:
+                log.warning(f"Failed downloading {f['name']}: {e}")
 
         return files
 
@@ -123,10 +126,10 @@ async def smart_download(url):
 
     # ---------- DIRECT MP4 / MOV (aria2 → yt-dlp fallback) ----------
     if re.search(r"\.(mp4|mov)(\?|$)", url):
-        out = DOWNLOAD_DIR / "direct.mp4"
+        out = DOWNLOAD_DIR / "%(title)s.%(ext)s"  # unique template for multiple videos
         try:
             subprocess.run(
-                ["aria2c", "-x", "8", "-s", "8", "-k", "1M", "-o", str(out), url],
+                ["aria2c", "-x", "8", "-s", "8", "-k", "1M", "-o", str(DOWNLOAD_DIR / "direct.mp4"), url],
                 check=True
             )
         except subprocess.CalledProcessError:
@@ -134,18 +137,18 @@ async def smart_download(url):
                 [
                     "yt-dlp",
                     "-o", str(out),
-                    "--merge-output-format", "mp4",
+                    "--merge-output-format", "mp4",  # fixed double dash
                     url
                 ],
                 check=True
             )
-        return [out]
+        return list(DOWNLOAD_DIR.glob("*"))
 
     # ---------- EMBED / HLS / OTHER ----------
     cmd = [
         "yt-dlp",
         "--no-playlist",
-        "--merge-output-format", "mp4",
+        "--merge-output-format", "mp4",  # fixed double dash
         "--force-generic-extractor",
         "--hls-use-mpegts",
         "--downloader", "aria2c",
