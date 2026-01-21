@@ -21,7 +21,6 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 DOWNLOAD_DIR = Path("output")
 MAX_TG_SIZE = 1990 * 1024 * 1024
 MIN_FREE_SPACE_MB = 500
-MAX_PART_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("BOT")
@@ -32,8 +31,6 @@ app = Client(
     api_hash=API_HASH,
     session_string=SESSION_STRING
 )
-
-# ------------------- Helpers -------------------
 
 def get_free_space():
     return shutil.disk_usage(os.getcwd()).free
@@ -57,11 +54,14 @@ async def progress_bar(current, total, status_msg, action_name):
         status_msg.last_update = now
         perc = current * 100 / total
         bar = get_progress_bar(perc)
-        await status_msg.edit(f"{action_name}\n{bar}\n{format_bytes(current)} / {format_bytes(total)}")
+        await status_msg.edit(
+            f"{action_name}\n{bar}\n"
+            f"{format_bytes(current)} / {format_bytes(total)}"
+        )
     except Exception as e:
         log.debug(f"Progress update error: {e}")
 
-# ✅ Thumbnail + faststart
+# ✅ ADDED (only for thumbnail + streaming fix)
 def faststart_mp4(src):
     dst = src + ".fast.mp4"
     subprocess.run(
@@ -80,47 +80,22 @@ def make_thumb(src):
     )
     return thumb if os.path.exists(thumb) else None
 
-def split_video(src):
-    """Split video into 2GB parts"""
-    size = os.path.getsize(src)
-    if size <= MAX_PART_SIZE:
-        return [src]
-    base = str(src).replace(".mp4", "")
-    subprocess.run([
-        "ffmpeg", "-y", "-i", src,
-        "-c", "copy",
-        "-map", "0",
-        "-f", "segment",
-        "-segment_bytes", str(MAX_PART_SIZE),
-        f"{base}_part_%03d.mp4"
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return sorted([str(p) for p in Path(".").glob(base + "_part_*.mp4")])
-
-async def yt_dlp_download(url, output_dir):
-    """Download YouTube/Pixeldrain/HLS/m3u8/direct links using yt-dlp"""
-    os.makedirs(output_dir, exist_ok=True)
-    cmd = [
-        "yt-dlp",
-        "-f", "bv*+ba/b",
-        "--merge-output-format", "mp4",
-        "--remux-video", "mp4",
-        "--external-downloader", "aria2c",
-        "--external-downloader-args", "-x16 -k1M",
-        "-o", str(Path(output_dir)/"%(title)s.%(ext)s"),
-        url
-    ]
-    proc = await asyncio.create_subprocess_exec(*cmd,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL
-    )
-    await proc.communicate()
-    return sorted(list(Path(output_dir).glob("*.mp4")))
-
-# ------------------- Main Handler -------------------
-
 @app.on_message(filters.text & (filters.outgoing | filters.private))
 async def handler(client, message: Message):
-    text = message.text.strip()
+    text = message.text
+
+    # Determine link type
+    gofile_match = re.search(r"gofile\.io/d/([\w\-]+)", text)
+    direct_match = any(re.search(p, text) for p in [
+        r"\.mp4$", r"\.mov$", r"\.m3u8$",
+        r"^https?:\/\/(www\.)?youtube\.com",
+        r"^https?:\/\/(www\.)?youtu\.be",
+        r"^https?:\/\/(www\.)?pixeldrain\.com",
+        r"saint2\.cr/embed"
+    ])
+
+    if not gofile_match and not direct_match:
+        return
 
     if get_free_space() < MIN_FREE_SPACE_MB * 1024 * 1024:
         return await message.reply("Disk Full.")
@@ -132,24 +107,33 @@ async def handler(client, message: Message):
     try:
         files = []
 
-        # ---------------- GoFile ----------------
-        m = re.search(r"gofile\.io/d/([\w\-]+)", text)
-        if m:
+        # ---- GoFile files ----
+        if gofile_match:
             go = GoFile()
-            files = go.get_files(dir=str(DOWNLOAD_DIR), content_id=m.group(1))
+            files = go.get_files(dir=str(DOWNLOAD_DIR), content_id=gofile_match.group(1))
+        
+        # ---- Direct / yt-dlp URLs ----
+        elif direct_match:
+            from yt_dlp import YoutubeDL
 
-        # ---------------- Direct/yt-dlp/Pixeldrain/HLS ----------------
-        elif any(re.search(p, text) for p in [
-            r"\.mp4$", r"\.mov$", r"\.m3u8$",
-            r"^https?:\/\/(www\.)?youtube\.com",
-            r"^https?:\/\/(www\.)?youtu\.be",
-            r"^https?:\/\/(www\.)?pixeldrain\.com",
-            r"saint2\.cr/embed"
-        ]):
-            files = await yt_dlp_download(text, str(DOWNLOAD_DIR))
-        else:
-            await status.edit("No supported link found.")
-            return
+            ydl_opts = {
+                "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
+                "format": "bestvideo+bestaudio/best",
+                "merge_output_format": "mp4",
+                "external_downloader": "aria2c",
+                "external_downloader_args": "-x16 -k1M",
+                "noplaylist": True,
+            }
+
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(text, download=True)
+                # Normalize output files
+                if "entries" in info:
+                    # playlist
+                    for entry in info["entries"]:
+                        files.append(Path(ydl.prepare_filename(entry)))
+                else:
+                    files.append(Path(ydl.prepare_filename(info)))
 
         if not files:
             await status.edit("No files found.")
@@ -157,33 +141,110 @@ async def handler(client, message: Message):
 
         await status.edit(f"Found {len(files)} file(s). Processing...")
 
-        # ---------------- Upload ----------------
-        for idx, file in enumerate(files, 1):
-            file_name = os.path.basename(file)
-            await status.edit(f"[{idx}/{len(files)}] Processing: {file_name[:30]}...")
+        # ---- Normalize everything to Path strings ----
+        normalized_files = []
+        for f in files:
+            if isinstance(f, File):
+                normalized_files.append(f.dest)
+            else:
+                normalized_files.append(str(f))
 
-            fixed = faststart_mp4(str(file))
-            thumb = make_thumb(fixed)
+        for idx, file_path in enumerate(normalized_files, 1):
+            if get_free_space() < MIN_FREE_SPACE_MB * 1024 * 1024:
+                await status.edit("Disk Full. Stopped.")
+                break
 
-            parts = split_video(fixed)
-            for i, part in enumerate(parts, 1):
-                caption = file_name if len(parts)==1 else f"{file_name} [Part {i}/{len(parts)}]"
-                await client.send_video(
-                    "me",
-                    video=part,
-                    caption=caption,
-                    supports_streaming=True,
-                    thumb=thumb,
-                    progress=progress_bar,
-                    progress_args=(status, f"[{idx}/{len(files)}] Uploading Part {i}/{len(parts)}")
+            file_name = os.path.basename(file_path)
+            await status.edit(f"[{idx}/{len(normalized_files)}] Downloading: {file_name[:30]}...")
+
+            upload_queue = asyncio.Queue()
+            download_complete = asyncio.Event()
+            loop = asyncio.get_running_loop()
+
+            # For GoFile this will be called by Downloader, for direct files we just put it immediately
+            def on_part_ready(path, part_num, total_parts, size):
+                asyncio.run_coroutine_threadsafe(
+                    upload_queue.put((path, part_num, total_parts)),
+                    loop
                 )
-                try: os.remove(part)
-                except: pass
 
-            for f in (file, fixed, thumb):
+            # If GoFile: use downloader, else skip
+            async def download_task():
                 try:
-                    if f and os.path.exists(f): os.remove(f)
-                except: pass
+                    if gofile_match:
+                        Downloader(token=go.token).download(File(file_path), 1, on_part_ready)
+                    else:
+                        # For direct/yt-dlp URLs, treat as single ready part
+                        on_part_ready(file_path, 1, 1, os.path.getsize(file_path))
+                except Exception as e:
+                    log.error(f"Download error: {e}")
+                    await status.edit(f"Download failed: {str(e)[:50]}")
+                finally:
+                    download_complete.set()
+
+            async def upload_task():
+                while True:
+                    try:
+                        get_task = asyncio.create_task(upload_queue.get())
+                        wait_task = asyncio.create_task(download_complete.wait())
+                        done, pending = await asyncio.wait(
+                            [get_task, wait_task],
+                            return_when=asyncio.FIRST_COMPLETED
+                        )
+
+                        if get_task in done:
+                            path, part_num, total_parts = await get_task
+                            if wait_task in pending:
+                                wait_task.cancel()
+
+                            if not os.path.exists(path):
+                                continue
+
+                            caption = file_name
+                            if total_parts > 1:
+                                caption = f"{file_name} [Part {part_num}/{total_parts}]"
+
+                            await status.edit(
+                                f"[{idx}/{len(normalized_files)}] Uploading part {part_num}/{total_parts}..."
+                            )
+
+                            fixed = faststart_mp4(str(path))
+                            thumb = make_thumb(fixed)
+
+                            try:
+                                await client.send_video(
+                                    "me",
+                                    video=fixed,
+                                    caption=caption,
+                                    supports_streaming=True,
+                                    thumb=thumb,
+                                    progress=progress_bar,
+                                    progress_args=(
+                                        status,
+                                        f"[{idx}/{len(normalized_files)}] Uploading {part_num}/{total_parts}"
+                                    )
+                                )
+                            except Exception as send_err:
+                                log.error(f"Send error: {send_err}")
+
+                            for f in (path, fixed, thumb):
+                                try:
+                                    if f and os.path.exists(f):
+                                        os.remove(f)
+                                except:
+                                    pass
+                        else:
+                            if get_task in pending:
+                                get_task.cancel()
+                            if upload_queue.empty():
+                                break
+
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        log.error(f"Upload task error: {e}")
+
+            await asyncio.gather(download_task(), upload_task())
 
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         await status.edit("All done!")
@@ -193,5 +254,4 @@ async def handler(client, message: Message):
         await status.edit(f"Error: {str(e)[:100]}")
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
 
-# ------------------- Run -------------------
 app.run()
