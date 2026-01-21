@@ -62,7 +62,7 @@ def faststart_mp4(src):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
-    return dst
+    return dst if os.path.exists(dst) else src
 
 def make_thumb(src):
     t = src + ".jpg"
@@ -76,30 +76,33 @@ def make_thumb(src):
 def normalize_path(p):
     return str(p.dest) if hasattr(p, "dest") else str(p)
 
-# ---------------- yt-dlp (SAFE) ----------------
+# ---------------- SMART DOWNLOAD ----------------
 
-async def ytdlp_download(url, status):
-    out = DOWNLOAD_DIR / "%(title)s.%(ext)s"
+async def smart_download(url):
+    # --- DIRECT MP4 / MOV (signed links) ---
+    if re.search(r"\.(mp4|mov)(\?|$)", url):
+        out = DOWNLOAD_DIR / "direct.mp4"
+        subprocess.run(
+            ["aria2c", "-x", "8", "-s", "8", "-k", "1M", "-o", str(out), url],
+            check=True
+        )
+        return [out]
+
+    # --- EMBED / HLS / SITES ---
     cmd = [
         "yt-dlp",
         "--no-playlist",
         "--merge-output-format", "mp4",
+        "--force-generic-extractor",
+        "--hls-use-mpegts",
         "--downloader", "aria2c",
         "--downloader-args", "aria2c:-x 8 -s 8 -k 1M",
-        "-o", str(out),
+        "-o", str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
         url
     ]
 
-    p = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE
-    )
-
-    await p.communicate()
-
-    files = list(DOWNLOAD_DIR.glob("*"))
-    return files
+    subprocess.run(cmd, check=True)
+    return list(DOWNLOAD_DIR.glob("*"))
 
 # ---------------- handler ----------------
 
@@ -121,7 +124,7 @@ async def handler(client, message: Message):
             go = GoFile()
             files = go.get_files(dir=str(DOWNLOAD_DIR), content_id=m.group(1))
 
-            for idx, f in enumerate(files, 1):
+            for f in files:
                 q = asyncio.Queue()
                 done = asyncio.Event()
                 loop = asyncio.get_running_loop()
@@ -144,10 +147,11 @@ async def handler(client, message: Message):
                     while True:
                         g = asyncio.create_task(q.get())
                         w = asyncio.create_task(done.wait())
-                        d, _ = await asyncio.wait(
+                        done_set, _ = await asyncio.wait(
                             [g, w], return_when=asyncio.FIRST_COMPLETED
                         )
-                        if g in d:
+
+                        if g in done_set:
                             path, part, total = await g
                             real = normalize_path(path)
                             fixed = faststart_mp4(real)
@@ -171,10 +175,10 @@ async def handler(client, message: Message):
 
                 await asyncio.gather(dl(), up())
 
-        # ---------- YT-DLP ----------
+        # ---------- SMART DOWNLOAD ----------
         else:
-            await status.edit("Downloading via yt-dlp...")
-            files = await ytdlp_download(text, status)
+            await status.edit("Downloading...")
+            files = await smart_download(text)
 
             for f in files:
                 fixed = faststart_mp4(str(f))
