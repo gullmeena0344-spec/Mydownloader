@@ -58,7 +58,7 @@ class Downloader:
     def _make_streamable(self, src, dst):
         subprocess.run(
             [
-                "ffmpeg",
+                "./ffmpeg_static",
                 "-y",
                 "-i", src,
                 "-c:v", "copy",
