@@ -22,7 +22,7 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 DOWNLOAD_DIR = Path("output")
 MAX_TG_SIZE = 1990 * 1024 * 1024
 MIN_FREE_SPACE_MB = 500
-MAX_PART_SIZE = 1900 * 1024 * 1024  # Adjusted to ~1.9GB for max efficiency
+MAX_PART_SIZE = 1900 * 1024 * 1024
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("BOT")
@@ -81,37 +81,98 @@ async def progress_bar(current, total, status, title):
 FFMPEG_PATH = "./ffmpeg_static"
 
 def faststart_mp4(src):
-    dst = src + ".fast.mp4"
+    """
+    Safely runs ffmpeg by temporarily renaming the file to ASCII
+    if it contains emojis or special characters.
+    """
+    if not os.path.exists(src):
+        return src
+
+    dir_name = os.path.dirname(src)
+    # Define temporary safe paths
+    temp_input = os.path.join(dir_name, f"temp_fs_in_{int(time.time())}.mp4")
+    temp_output = os.path.join(dir_name, f"temp_fs_out_{int(time.time())}.mp4")
+    final_dst = src + ".fast.mp4"
+
+    renamed_input = False
+
     try:
+        # 1. Rename complex filename to simple ASCII
+        os.rename(src, temp_input)
+        renamed_input = True
+
+        # 2. Run FFmpeg on the safe filename
         subprocess.run(
-            [FFMPEG_PATH, "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", dst],
+            [FFMPEG_PATH, "-y", "-i", temp_input, "-c", "copy", "-movflags", "+faststart", temp_output],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
-        if os.path.exists(dst):
-            return dst
-    except:
-        pass
+
+        # 3. If success, move output to final destination and restore input name
+        if os.path.exists(temp_output):
+            if os.path.exists(final_dst): os.remove(final_dst)
+            os.rename(temp_output, final_dst)
+            
+            os.rename(temp_input, src) # Restore original
+            return final_dst
+
+    except Exception as e:
+        log.error(f"Faststart Error: {e}")
+
+    # Fallback: Restore original name if something failed
+    if renamed_input and os.path.exists(temp_input):
+        os.rename(temp_input, src)
+    
     return src
 
 def make_thumb(src):
-    thumb = src + ".jpg"
+    """
+    Safely generates thumbnail by temporarily renaming the file to ASCII.
+    """
+    if not os.path.exists(src):
+        return None
+
+    dir_name = os.path.dirname(src)
+    temp_input = os.path.join(dir_name, f"temp_th_in_{int(time.time())}.mp4")
+    thumb_output = src + ".jpg"
+    
+    renamed_input = False
+
     try:
+        # 1. Rename to safe ASCII
+        os.rename(src, temp_input)
+        renamed_input = True
+
+        # 2. Generate Thumb
         subprocess.run(
-            [FFMPEG_PATH, "-y", "-i", src, "-ss", "00:00:01", "-vframes", "1", thumb],
+            [FFMPEG_PATH, "-y", "-i", temp_input, "-ss", "00:00:01", "-vframes", "1", thumb_output],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
-        if os.path.exists(thumb):
-            return thumb
-    except:
-        pass
+
+        # 3. Restore original filename
+        os.rename(temp_input, src)
+        
+        if os.path.exists(thumb_output):
+            return thumb_output
+
+    except Exception as e:
+        log.error(f"Thumb Error: {e}")
+
+    # Fallback: Restore original name
+    if renamed_input and os.path.exists(temp_input):
+        os.rename(temp_input, src)
+        
     return None
 
 def normalize_path(p):
     return str(p.dest) if hasattr(p, "dest") else str(p)
 
 # ---------------- SMART DOWNLOAD ----------------
+
+def clean_filename(name):
+    # Removes emojis and special chars, keeping only A-Z, 0-9, . - _
+    return re.sub(r'[^\w\-. ]', '', name)
 
 async def smart_download(url):
     # 1. Pixeldrain List (Album)
@@ -121,11 +182,10 @@ async def smart_download(url):
             r = requests.get(f"https://pixeldrain.com/api/list/{m.group(1)}").json()
             files = []
             for idx, f in enumerate(r.get("files", []), 1):
-                # Clean filename
-                safe_name = re.sub(r'[\\/*?:"<>|]', "", f['name'])
+                # Clean filename STRICTLY
+                safe_name = clean_filename(f['name'])
                 out = DOWNLOAD_DIR / f"{idx}_{safe_name}"
                 
-                # Use API URL
                 api_url = f"https://pixeldrain.com/api/file/{f['id']}"
                 subprocess.run(
                     ["aria2c", "-x", "4", "-k", "1M", "-o", str(out), api_url],
@@ -143,40 +203,53 @@ async def smart_download(url):
         file_id = m.group(1)
         api_url = f"https://pixeldrain.com/api/file/{file_id}"
         
-        # Try to get real filename via API, fallback to ID.mp4
         try:
             info = requests.get(f"https://pixeldrain.com/api/file/{file_id}/info").json()
-            filename = re.sub(r'[\\/*?:"<>|]', "", info.get("name", f"{file_id}.mp4"))
+            # Clean filename STRICTLY
+            filename = clean_filename(info.get("name", f"{file_id}.mp4"))
         except:
             filename = f"{file_id}.mp4"
 
         out = DOWNLOAD_DIR / filename
         
-        # Use fewer connections (-x 4) for Pixeldrain to avoid dropping
         subprocess.run(
             ["aria2c", "-x", "4", "-k", "1M", "-o", str(filename), "-d", str(DOWNLOAD_DIR), api_url],
             check=True
         )
         return [out]
 
-    # 3. Direct Links (MP4/MOV)
-    if re.search(r"\.(mp4|mov|mkv)(\?|$)", url):
+    # 3. Direct Links
+    if re.search(r"\.(mp4|mov|mkv|webm|avi|flv)(\?|$)", url) or \
+       any(domain in url for domain in ["cdn3.mfcamhub.com", "dl1.turbocdn.st", "saint2.su"]):
         try:
-            # Try aria2c first for speed
-            out_name = "direct_video.mp4"
+            filename = "video.mp4"
+            if "fn=" in url:
+                filename = re.search(r"fn=([^&]+)", url).group(1)
+            elif "file=" in url:
+                filename = os.path.basename(re.search(r"file=([^&]+)", url).group(1))
+            elif ".mp4" in url:
+                m = re.search(r"/([^/?#]+\.mp4)", url)
+                if m: filename = m.group(1)
+
+            # Clean filename STRICTLY
+            filename = clean_filename(filename)
+            out = DOWNLOAD_DIR / filename
+            
             subprocess.run(
-                ["aria2c", "-x", "8", "-s", "8", "-k", "1M", "-d", str(DOWNLOAD_DIR), url],
+                ["aria2c", "-x", "8", "-s", "8", "-k", "1M", "-o", filename, "-d", str(DOWNLOAD_DIR), 
+                 "--header", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                 url],
                 check=True
             )
-            return list(DOWNLOAD_DIR.glob("*"))
+            return [out]
         except subprocess.CalledProcessError:
-            # Fallback to yt-dlp if aria2c fails (e.g. headers required)
             pass
 
-    # 4. Generic yt-dlp (YouTube, etc)
+    # 4. Generic yt-dlp
     cmd = [
         "yt-dlp",
         "--no-playlist",
+        "--restrict-filenames", # Forces ASCII filenames to avoid emoji errors
         "--merge-output-format", "mp4",
         "-o", str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
         url
@@ -209,8 +282,6 @@ async def handler(client, message: Message):
                 file_name = os.path.basename(f.dest)
                 real_path = normalize_path(f)
                 
-                # FIXED: Don't calculate size here, file doesn't exist yet!
-                
                 upload_queue = asyncio.Queue()
                 download_done = asyncio.Event()
                 loop = asyncio.get_running_loop()
@@ -220,10 +291,7 @@ async def handler(client, message: Message):
 
                 async def download_task():
                     try:
-                        # Add a wrapper to track download progress for GoFile
                         def on_part_with_progress(path, part, total_parts, size):
-                            # We can't easily get 'current' total across all parts here without more state,
-                            # but we can at least signal part completion.
                             on_part(path, part, total_parts, size)
 
                         await asyncio.to_thread(Downloader(token=go.token).download, f, 1, on_part_with_progress)
@@ -240,16 +308,13 @@ async def handler(client, message: Message):
                             path, part_num, total_parts = await get_task
                             if wait_task in pending: wait_task.cancel()
                             
-                            # Wait briefly for IO buffers to flush
                             await asyncio.sleep(0.5)
                             
                             if not os.path.exists(path): continue
                             
-                            # NOW it is safe to check size
                             current_file_size = os.path.getsize(path)
                             parts = max(1, math.ceil(current_file_size / MAX_PART_SIZE))
 
-                            # Split manually into chunks if bigger
                             if parts > 1:
                                 for i in range(parts):
                                     start = i * MAX_PART_SIZE
@@ -279,6 +344,7 @@ async def handler(client, message: Message):
 
                                     if os.path.exists(chunk_path): os.remove(chunk_path)
                                     if fixed != chunk_path and os.path.exists(fixed): os.remove(fixed)
+                                    if thumb: os.remove(thumb)
                             else:
                                 fixed = faststart_mp4(path)
                                 thumb = make_thumb(fixed)
@@ -297,6 +363,7 @@ async def handler(client, message: Message):
 
                                 if os.path.exists(path): os.remove(path)
                                 if fixed != path and os.path.exists(fixed): os.remove(fixed)
+                                if thumb: os.remove(thumb)
 
                         else:
                             if get_task in pending: get_task.cancel()
@@ -320,7 +387,6 @@ async def handler(client, message: Message):
                 file_name = os.path.basename(f_path)
                 fixed = faststart_mp4(f_path)
                 
-                # Check size for splitting
                 file_size = os.path.getsize(fixed)
                 parts = max(1, math.ceil(file_size / MAX_PART_SIZE))
                 
@@ -336,7 +402,6 @@ async def handler(client, message: Message):
                             src.seek(start)
                             dst.write(src.read(end - start))
 
-                        # Faststart the chunk too (helps telegram stream it)
                         fixed_chunk = faststart_mp4(chunk_path)
                         thumb_chunk = make_thumb(fixed_chunk)
                         caption = f"{file_name} [Part {i+1}/{parts}]"
