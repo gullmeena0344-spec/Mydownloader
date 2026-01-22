@@ -1,8 +1,3 @@
-import static_ffmpeg
-    static_ffmpeg.add_paths()
-except ImportError:
-    print("Static FFmpeg not installed. Please add 'static-ffmpeg' to requirements.txt")
-
 import os
 import re
 import math
@@ -83,11 +78,13 @@ async def progress_bar(current, total, status, title):
     except:
         pass
 
+FFMPEG_PATH = "./ffmpeg_static"
+
 def faststart_mp4(src):
     dst = src + ".fast.mp4"
     try:
         subprocess.run(
-            ["ffmpeg", "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", dst],
+            [FFMPEG_PATH, "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", dst],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
@@ -101,7 +98,7 @@ def make_thumb(src):
     thumb = src + ".jpg"
     try:
         subprocess.run(
-            ["ffmpeg", "-y", "-i", src, "-ss", "00:00:01", "-vframes", "1", thumb],
+            [FFMPEG_PATH, "-y", "-i", src, "-ss", "00:00:01", "-vframes", "1", thumb],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
