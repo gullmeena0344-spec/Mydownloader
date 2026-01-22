@@ -1,3 +1,8 @@
+import static_ffmpeg
+    static_ffmpeg.add_paths()
+except ImportError:
+    print("Static FFmpeg not installed. Please add 'static-ffmpeg' to requirements.txt")
+
 import os
 import re
 import math
@@ -40,25 +45,40 @@ def get_free_space():
     return shutil.disk_usage(os.getcwd()).free
 
 def format_bytes(size):
-    for u in ["B", "KB", "MB", "GB"]:
+    for u in ["B", "KB", "MB", "GB", "TB"]:
         if size < 1024:
             return f"{size:.2f} {u}"
         size /= 1024
 
-def get_progress_bar(percent, total=20):
+def get_progress_bar(percent, total=15):
     filled = int(total * percent // 100)
-    return f"[{'█'*filled}{'░'*(total-filled)}] {percent:.1f}%"
+    return f"▰{'▰'*filled}{'▱'*(total-filled-1)}▱"
 
 async def progress_bar(current, total, status, title):
     try:
         now = time.time()
-        if hasattr(status, "last") and now - status.last < 2:
+        if hasattr(status, "last") and now - status.last < 1.5:
             return
         status.last = now
         p = (current * 100 / total) if total > 0 else 0
+        
+        # Calculate speed and ETA
+        if not hasattr(status, "start_time"):
+            status.start_time = now
+            status.last_current = current
+        
+        diff = now - status.start_time
+        speed = current / diff if diff > 0 else 0
+        eta = (total - current) / speed if speed > 0 else 0
+        
+        eta_str = time.strftime("%M:%S", time.gmtime(eta)) if eta < 3600 else "Wait..."
+        
         await status.edit(
-            f"{title}\n{get_progress_bar(p)}\n"
-            f"{format_bytes(current)} / {format_bytes(total)}"
+            f"<b>{title}</b>\n"
+            f"<code>{get_progress_bar(p)} {p:.1f}%</code>\n"
+            f"<b>Size:</b> {format_bytes(current)} / {format_bytes(total)}\n"
+            f"<b>Speed:</b> {format_bytes(speed)}/s\n"
+            f"<b>ETA:</b> {eta_str}"
         )
     except:
         pass
@@ -203,7 +223,13 @@ async def handler(client, message: Message):
 
                 async def download_task():
                     try:
-                        await asyncio.to_thread(Downloader(token=go.token).download, f, 1, on_part)
+                        # Add a wrapper to track download progress for GoFile
+                        def on_part_with_progress(path, part, total_parts, size):
+                            # We can't easily get 'current' total across all parts here without more state,
+                            # but we can at least signal part completion.
+                            on_part(path, part, total_parts, size)
+
+                        await asyncio.to_thread(Downloader(token=go.token).download, f, 1, on_part_with_progress)
                     finally:
                         download_done.set()
 
