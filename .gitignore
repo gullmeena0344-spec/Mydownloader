@@ -1,2 +1,17 @@
-node_modules/
+# Security (CRITICAL)
 .env
+*.session
+*.session-journal
+
+# Python junk
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Your bot's download folder (Don't commit videos!)
+output/
+
+# Mac/Windows junk
+.DS_Store
+Thumbs.db
