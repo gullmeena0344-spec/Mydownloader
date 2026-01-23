@@ -101,17 +101,22 @@ async def download_byte_range(url, start, end, filename):
 def generate_thumbnail(video_path):
     """Extracts thumbnail using FFmpeg"""
     thumb_path = f"{video_path}.jpg"
-    # Try 15s, failover to 2s
-    timestamps = ["00:00:15", "00:00:02"]
-    
+    # Try multiple timestamps: 15s, 2s, and 0s (beginning)
+    # For chunked videos, starting from 0s is more reliable
+    timestamps = ["00:00:15", "00:00:02", "00:00:00"]
+
     for ss in timestamps:
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", str(video_path), "-ss", ss, "-vframes", "1", thumb_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(video_path), "-ss", ss, "-vframes", "1",
+             "-vf", "scale=320:-1", thumb_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
         )
-        if os.path.exists(thumb_path):
+        if result.returncode == 0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+            log.info(f"Thumbnail generated at {ss} for {os.path.basename(video_path)}")
             return thumb_path
-            
+
+    log.warning(f"Failed to generate thumbnail for {video_path}")
     return None
 
 async def upload_video_safe(client, chat_id, path, caption, thumb, status, progress_text):
@@ -269,14 +274,24 @@ async def handler(client, message: Message):
                     # 2. Thumbnail Logic
                     # If it's Part 1, generate the Master Thumbnail
                     if part == 1:
+                        log.info(f"Generating thumbnail from part 1: {chunk_path}")
                         extracted = await asyncio.to_thread(generate_thumbnail, chunk_path)
                         if extracted:
                             global_thumb = str(DOWNLOAD_DIR / f"thumb_{index}.jpg")
                             os.rename(extracted, global_thumb)
+                            log.info(f"Thumbnail saved as: {global_thumb}")
+                        else:
+                            log.warning("Thumbnail generation failed for part 1")
 
                     # 3. Upload
                     caption = f"{name}\nPart {part}/{parts}"
-                    await upload_video_safe(client, "me", chunk_path, caption, global_thumb, status, f"Up Part {part}")
+                    # Verify thumbnail exists before using it
+                    thumb_to_use = global_thumb if global_thumb and os.path.exists(global_thumb) else None
+                    if thumb_to_use:
+                        log.info(f"Using thumbnail for part {part}: {thumb_to_use}")
+                    else:
+                        log.info(f"No thumbnail available for part {part}")
+                    await upload_video_safe(client, "me", chunk_path, caption, thumb_to_use, status, f"Up Part {part}")
 
                     # 4. Delete Chunk
                     os.remove(chunk_path)
