@@ -9,4 +9,3 @@ pyrogram
 tgcrypto
 yt-dlp
 aiohttp
-static-ffmpeg
