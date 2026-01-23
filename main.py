@@ -101,8 +101,23 @@ async def download_byte_range(url, start, end, filename):
 def generate_thumbnail(video_path):
     """Extracts thumbnail using FFmpeg"""
     thumb_path = f"{video_path}.jpg"
-    # Try multiple timestamps: 15s, 2s, and 0s (beginning)
-    # For chunked videos, starting from 0s is more reliable
+    # Try 15s, failover to 2s
+    timestamps = ["00:00:15", "00:00:02"]
+
+    for ss in timestamps:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(video_path), "-ss", ss, "-vframes", "1", thumb_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        if os.path.exists(thumb_path):
+            return thumb_path
+
+    return None
+
+def generate_thumbnail_for_chunk(video_path):
+    """Extracts thumbnail for video chunks (large videos) - tries 0s as fallback"""
+    thumb_path = f"{video_path}.jpg"
+    # For chunks: try 15s, 2s, then 0s (start of chunk)
     timestamps = ["00:00:15", "00:00:02", "00:00:00"]
 
     for ss in timestamps:
@@ -113,10 +128,10 @@ def generate_thumbnail(video_path):
             stderr=subprocess.DEVNULL
         )
         if result.returncode == 0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
-            log.info(f"Thumbnail generated at {ss} for {os.path.basename(video_path)}")
+            log.info(f"Chunk thumbnail generated at {ss} for {os.path.basename(video_path)}")
             return thumb_path
 
-    log.warning(f"Failed to generate thumbnail for {video_path}")
+    log.warning(f"Failed to generate chunk thumbnail for {video_path}")
     return None
 
 async def upload_video_safe(client, chat_id, path, caption, thumb, status, progress_text):
@@ -275,7 +290,7 @@ async def handler(client, message: Message):
                     # If it's Part 1, generate the Master Thumbnail
                     if part == 1:
                         log.info(f"Generating thumbnail from part 1: {chunk_path}")
-                        extracted = await asyncio.to_thread(generate_thumbnail, chunk_path)
+                        extracted = await asyncio.to_thread(generate_thumbnail_for_chunk, chunk_path)
                         if extracted:
                             global_thumb = str(DOWNLOAD_DIR / f"thumb_{index}.jpg")
                             os.rename(extracted, global_thumb)
