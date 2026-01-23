@@ -9,9 +9,8 @@ import subprocess
 import requests
 from pathlib import Path
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, errors
 from pyrogram.types import Message
-# Assuming run.py contains these classes
 from run import GoFile, Downloader, File
 
 # --- Config ---
@@ -20,9 +19,10 @@ API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
 DOWNLOAD_DIR = Path("output")
-MAX_TG_SIZE = 1990 * 1024 * 1024
-MIN_FREE_SPACE_MB = 500
+# Telegram's Limit is ~2000MB. We split at 1900MB to be safe.
 MAX_PART_SIZE = 1900 * 1024 * 1024
+# If free space drops below 200MB, the bot stops to prevent OS crash.
+MIN_FREE_SPACE_MB = 200 
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("BOT")
@@ -52,12 +52,12 @@ def get_progress_bar(percent, total=15):
 async def progress_bar(current, total, status, title):
     try:
         now = time.time()
-        if hasattr(status, "last") and now - status.last < 1.5:
+        # Update progress only every 2 seconds to save CPU
+        if hasattr(status, "last") and now - status.last < 2:
             return
         status.last = now
         p = (current * 100 / total) if total > 0 else 0
         
-        # Calculate speed and ETA
         if not hasattr(status, "start_time"):
             status.start_time = now
             status.last_current = current
@@ -66,7 +66,7 @@ async def progress_bar(current, total, status, title):
         speed = current / diff if diff > 0 else 0
         eta = (total - current) / speed if speed > 0 else 0
         
-        eta_str = time.strftime("%M:%S", time.gmtime(eta)) if eta < 3600 else "Wait..."
+        eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
         
         await status.edit(
             f"<b>{title}</b>\n"
@@ -78,91 +78,82 @@ async def progress_bar(current, total, status, title):
     except:
         pass
 
-FFMPEG_PATH = "./ffmpeg_static"
+# Use system FFmpeg installed via Dockerfile
+FFMPEG_PATH = "ffmpeg"
 
-def faststart_mp4(src):
+def run_command(cmd):
+    """Runs a command and hides output unless there is an error"""
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        return True
+    except subprocess.CalledProcessError as e:
+        log.error(f"FFmpeg Error: {e.stderr.decode()[:200]}")
+        return False
+
+def smart_faststart(src):
     """
-    Safely runs ffmpeg by temporarily renaming the file to ASCII
-    if it contains emojis or special characters.
+    Checks if we have enough space to optimize the video.
+    If not, it returns the original file to prevent disk fill-up.
     """
     if not os.path.exists(src):
         return src
 
+    file_size = os.path.getsize(src)
+    free_space = get_free_space()
+
+    # MATH: To run faststart, we need space for the Copy + Buffer
+    needed_space = file_size + (100 * 1024 * 1024)
+
+    if free_space < needed_space:
+        log.warning(f"⚠️ Low Disk: Skipping Faststart for {os.path.basename(src)}")
+        return src
+
     dir_name = os.path.dirname(src)
-    # Define temporary safe paths
-    temp_input = os.path.join(dir_name, f"temp_fs_in_{int(time.time())}.mp4")
-    temp_output = os.path.join(dir_name, f"temp_fs_out_{int(time.time())}.mp4")
+    temp_output = os.path.join(dir_name, f"temp_{int(time.time())}.mp4")
     final_dst = src + ".fast.mp4"
 
-    renamed_input = False
+    # Run FFmpeg
+    success = run_command([
+        FFMPEG_PATH, "-y", "-i", src, 
+        "-c", "copy", "-movflags", "+faststart", 
+        temp_output
+    ])
 
-    try:
-        # 1. Rename complex filename to simple ASCII
-        os.rename(src, temp_input)
-        renamed_input = True
-
-        # 2. Run FFmpeg on the safe filename
-        subprocess.run(
-            [FFMPEG_PATH, "-y", "-i", temp_input, "-c", "copy", "-movflags", "+faststart", temp_output],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-
-        # 3. If success, move output to final destination and restore input name
-        if os.path.exists(temp_output):
-            if os.path.exists(final_dst): os.remove(final_dst)
-            os.rename(temp_output, final_dst)
-            
-            os.rename(temp_input, src) # Restore original
-            return final_dst
-
-    except Exception as e:
-        log.error(f"Faststart Error: {e}")
-
-    # Fallback: Restore original name if something failed
-    if renamed_input and os.path.exists(temp_input):
-        os.rename(temp_input, src)
+    if success and os.path.exists(temp_output):
+        # Move successful file to destination
+        if os.path.exists(final_dst): os.remove(final_dst)
+        os.rename(temp_output, final_dst)
+        # Delete original strictly
+        os.remove(src) 
+        return final_dst
     
     return src
 
-def make_thumb(src):
+def make_thumb_safe(src):
     """
-    Safely generates thumbnail by temporarily renaming the file to ASCII.
+    Generates a thumbnail at 15 seconds to avoid black/blue screens.
     """
-    if not os.path.exists(src):
-        return None
-
-    dir_name = os.path.dirname(src)
-    temp_input = os.path.join(dir_name, f"temp_th_in_{int(time.time())}.mp4")
-    thumb_output = src + ".jpg"
+    if not os.path.exists(src): return None
     
-    renamed_input = False
+    thumb_output = f"{src}.jpg"
+    
+    # Attempt 1: Take frame at 00:00:15 (Usually good content)
+    success = run_command([
+        FFMPEG_PATH, "-y", "-i", src, 
+        "-ss", "00:00:15", "-vframes", "1", 
+        thumb_output
+    ])
+    
+    # Attempt 2: If video is short, take frame at 00:00:02
+    if not success or not os.path.exists(thumb_output):
+        run_command([
+            FFMPEG_PATH, "-y", "-i", src, 
+            "-ss", "00:00:02", "-vframes", "1", 
+            thumb_output
+        ])
 
-    try:
-        # 1. Rename to safe ASCII
-        os.rename(src, temp_input)
-        renamed_input = True
-
-        # 2. Generate Thumb
-        subprocess.run(
-            [FFMPEG_PATH, "-y", "-i", temp_input, "-ss", "00:00:01", "-vframes", "1", thumb_output],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-
-        # 3. Restore original filename
-        os.rename(temp_input, src)
-        
-        if os.path.exists(thumb_output):
-            return thumb_output
-
-    except Exception as e:
-        log.error(f"Thumb Error: {e}")
-
-    # Fallback: Restore original name
-    if renamed_input and os.path.exists(temp_input):
-        os.rename(temp_input, src)
-        
+    if os.path.exists(thumb_output):
+        return thumb_output
     return None
 
 def normalize_path(p):
@@ -171,91 +162,96 @@ def normalize_path(p):
 # ---------------- SMART DOWNLOAD ----------------
 
 def clean_filename(name):
-    # Removes emojis and special chars, keeping only A-Z, 0-9, . - _
+    # Only allow safe characters
     return re.sub(r'[^\w\-. ]', '', name)
 
 async def smart_download(url):
-    # 1. Pixeldrain List (Album)
+    # Safety Check
+    if get_free_space() < 300 * 1024 * 1024:
+        log.error("Disk Full. Stopping download.")
+        return []
+
+    # 1. Pixeldrain List
     m = re.search(r"pixeldrain\.com/l/(\w+)", url)
     if m:
         try:
             r = requests.get(f"https://pixeldrain.com/api/list/{m.group(1)}").json()
             files = []
             for idx, f in enumerate(r.get("files", []), 1):
-                # Clean filename STRICTLY
                 safe_name = clean_filename(f['name'])
                 out = DOWNLOAD_DIR / f"{idx}_{safe_name}"
-                
                 api_url = f"https://pixeldrain.com/api/file/{f['id']}"
-                subprocess.run(
-                    ["aria2c", "-x", "4", "-k", "1M", "-o", str(out), api_url],
+                
+                # --file-allocation=none prevents filling disk with zeros
+                await asyncio.to_thread(
+                    subprocess.run, 
+                    ["aria2c", "--file-allocation=none", "-x", "4", "-k", "10M", "-o", str(out), api_url], 
                     check=True
                 )
                 files.append(out)
             return files
-        except Exception as e:
-            log.error(f"Pixeldrain List Error: {e}")
+        except Exception:
             return []
 
-    # 2. Pixeldrain Single File
-    m = re.search(r"pixeldrain\.com/u/(\w+)", url)
-    if m:
-        file_id = m.group(1)
-        api_url = f"https://pixeldrain.com/api/file/{file_id}"
-        
+    # 2. Single File
+    filename = "video.mp4"
+    if "pixeldrain.com/u/" in url:
         try:
-            info = requests.get(f"https://pixeldrain.com/api/file/{file_id}/info").json()
-            # Clean filename STRICTLY
-            filename = clean_filename(info.get("name", f"{file_id}.mp4"))
-        except:
-            filename = f"{file_id}.mp4"
+            fid = re.search(r"pixeldrain\.com/u/(\w+)", url).group(1)
+            url = f"https://pixeldrain.com/api/file/{fid}"
+            filename = f"{fid}.mp4"
+        except: pass
+    elif "fn=" in url: filename = re.search(r"fn=([^&]+)", url).group(1)
+    elif ".mp4" in url: 
+        m = re.search(r"/([^/?#]+\.mp4)", url)
+        if m: filename = m.group(1)
 
-        out = DOWNLOAD_DIR / filename
-        
-        subprocess.run(
-            ["aria2c", "-x", "4", "-k", "1M", "-o", str(filename), "-d", str(DOWNLOAD_DIR), api_url],
+    filename = clean_filename(filename)
+    out = DOWNLOAD_DIR / filename
+    
+    try:
+        await asyncio.to_thread(
+            subprocess.run,
+            ["aria2c", "--file-allocation=none", "-x", "8", "-s", "8", "-k", "10M", 
+             "-o", filename, "-d", str(DOWNLOAD_DIR), 
+             "--header", "User-Agent: Mozilla/5.0", url],
             check=True
         )
         return [out]
-
-    # 3. Direct Links
-    if re.search(r"\.(mp4|mov|mkv|webm|avi|flv)(\?|$)", url) or \
-       any(domain in url for domain in ["cdn3.mfcamhub.com", "dl1.turbocdn.st", "saint2.su"]):
+    except Exception:
+        # Fallback yt-dlp
+        cmd = [
+            "yt-dlp", "--no-playlist", "--restrict-filenames",
+            "--merge-output-format", "mp4",
+            "-o", str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
+            url
+        ]
         try:
-            filename = "video.mp4"
-            if "fn=" in url:
-                filename = re.search(r"fn=([^&]+)", url).group(1)
-            elif "file=" in url:
-                filename = os.path.basename(re.search(r"file=([^&]+)", url).group(1))
-            elif ".mp4" in url:
-                m = re.search(r"/([^/?#]+\.mp4)", url)
-                if m: filename = m.group(1)
+            await asyncio.to_thread(subprocess.run, cmd, check=True)
+        except: pass
 
-            # Clean filename STRICTLY
-            filename = clean_filename(filename)
-            out = DOWNLOAD_DIR / filename
-            
-            subprocess.run(
-                ["aria2c", "-x", "8", "-s", "8", "-k", "1M", "-o", filename, "-d", str(DOWNLOAD_DIR), 
-                 "--header", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                 url],
-                check=True
-            )
-            return [out]
-        except subprocess.CalledProcessError:
-            pass
-
-    # 4. Generic yt-dlp
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--restrict-filenames", # Forces ASCII filenames to avoid emoji errors
-        "--merge-output-format", "mp4",
-        "-o", str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
-        url
-    ]
-    subprocess.run(cmd, check=True)
     return list(DOWNLOAD_DIR.glob("*"))
+
+async def upload_video_safe(client, chat_id, path, caption, thumb, status, progress_text):
+    """Handles uploads with retry logic"""
+    if not os.path.exists(path): return
+
+    try:
+        await client.send_video(
+            chat_id,
+            path,
+            caption=caption,
+            supports_streaming=True,
+            thumb=thumb,
+            progress=progress_bar,
+            progress_args=(status, progress_text)
+        )
+    except errors.FloodWait as e:
+        log.warning(f"FloodWait: Sleeping {e.value}s")
+        await asyncio.sleep(e.value + 5)
+        await upload_video_safe(client, chat_id, path, caption, thumb, status, progress_text)
+    except Exception as e:
+        log.error(f"Upload Error: {e}")
 
 # ---------------- handler ----------------
 
@@ -265,7 +261,7 @@ async def handler(client, message: Message):
     if not text.startswith("http"): return
 
     if get_free_space() < MIN_FREE_SPACE_MB * 1024 * 1024:
-        return await message.reply("Disk Full.")
+        return await message.reply(f"Disk Full. Free: {format_bytes(get_free_space())}")
 
     status = await message.reply("Starting...")
     shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
@@ -280,7 +276,6 @@ async def handler(client, message: Message):
 
             for idx, f in enumerate(files, 1):
                 file_name = os.path.basename(f.dest)
-                real_path = normalize_path(f)
                 
                 upload_queue = asyncio.Queue()
                 download_done = asyncio.Event()
@@ -293,7 +288,6 @@ async def handler(client, message: Message):
                     try:
                         def on_part_with_progress(path, part, total_parts, size):
                             on_part(path, part, total_parts, size)
-
                         await asyncio.to_thread(Downloader(token=go.token).download, f, 1, on_part_with_progress)
                     finally:
                         download_done.set()
@@ -309,57 +303,42 @@ async def handler(client, message: Message):
                             if wait_task in pending: wait_task.cancel()
                             
                             await asyncio.sleep(0.5)
-                            
                             if not os.path.exists(path): continue
                             
-                            current_file_size = os.path.getsize(path)
-                            parts = max(1, math.ceil(current_file_size / MAX_PART_SIZE))
+                            # --- 4GB SERVER LOGIC ---
+                            f_size = os.path.getsize(path)
+                            parts = max(1, math.ceil(f_size / MAX_PART_SIZE))
+                            
+                            # If file needs splitting but we don't have space for the copy
+                            if parts > 1 and get_free_space() < MAX_PART_SIZE:
+                                await status.edit(f"⚠️ File too big to split on 4GB server. Skipping: {file_name}")
+                                os.remove(path)
+                                continue
 
                             if parts > 1:
                                 for i in range(parts):
                                     start = i * MAX_PART_SIZE
-                                    end = min(start + MAX_PART_SIZE, current_file_size)
+                                    end = min(start + MAX_PART_SIZE, f_size)
                                     chunk_path = f"{path}.part{i+1}"
                                     
                                     with open(path, "rb") as src, open(chunk_path, "wb") as dst:
                                         src.seek(start)
                                         dst.write(src.read(end - start))
 
-                                    fixed = faststart_mp4(chunk_path)
-                                    thumb = make_thumb(fixed)
-                                    caption = f"{file_name} [Part {i+1}/{parts}]"
+                                    # Try faststart, fallback to original if no space
+                                    fixed = await asyncio.to_thread(smart_faststart, chunk_path)
+                                    thumb = await asyncio.to_thread(make_thumb_safe, fixed)
+                                    
+                                    await upload_video_safe(client, "me", fixed, f"{file_name} [{i+1}/{parts}]", thumb, status, f"Up {i+1}/{parts}")
 
-                                    try:
-                                        await client.send_video(
-                                            "me",
-                                            fixed,
-                                            caption=caption,
-                                            supports_streaming=True,
-                                            thumb=thumb,
-                                            progress=progress_bar,
-                                            progress_args=(status,f"[{idx}/{len(files)}] Uploading {i+1}/{parts}")
-                                        )
-                                    except Exception as e:
-                                        log.error(f"Upload failed: {e}")
-
+                                    # DELETE IMMEDIATELY
                                     if os.path.exists(chunk_path): os.remove(chunk_path)
                                     if fixed != chunk_path and os.path.exists(fixed): os.remove(fixed)
                                     if thumb: os.remove(thumb)
                             else:
-                                fixed = faststart_mp4(path)
-                                thumb = make_thumb(fixed)
-                                try:
-                                    await client.send_video(
-                                        "me",
-                                        fixed,
-                                        caption=file_name,
-                                        supports_streaming=True,
-                                        thumb=thumb,
-                                        progress=progress_bar,
-                                        progress_args=(status,f"[{idx}/{len(files)}] Uploading")
-                                    )
-                                except Exception as e:
-                                    log.error(f"Upload failed: {e}")
+                                fixed = await asyncio.to_thread(smart_faststart, path)
+                                thumb = await asyncio.to_thread(make_thumb_safe, fixed)
+                                await upload_video_safe(client, "me", fixed, file_name, thumb, status, "Uploading")
 
                                 if os.path.exists(path): os.remove(path)
                                 if fixed != path and os.path.exists(fixed): os.remove(fixed)
@@ -377,7 +356,7 @@ async def handler(client, message: Message):
             files = await smart_download(text)
 
             if not files:
-                await status.edit("No files found or download failed.")
+                await status.edit("Download failed.")
                 return
 
             for idx, f in enumerate(files, 1):
@@ -385,12 +364,21 @@ async def handler(client, message: Message):
                 if not os.path.exists(f_path): continue
                 
                 file_name = os.path.basename(f_path)
-                fixed = faststart_mp4(f_path)
+                f_size = os.path.getsize(f_path)
                 
+                # Check for splitting requirement vs Space
+                parts = max(1, math.ceil(f_size / MAX_PART_SIZE))
+                if parts > 1 and get_free_space() < MAX_PART_SIZE:
+                     await status.edit(f"⚠️ Not enough space to split {file_name} (Need ~2GB free).")
+                     os.remove(f_path)
+                     continue
+
+                # Run faststart only if space exists
+                fixed = await asyncio.to_thread(smart_faststart, f_path)
+                
+                # Re-calculate size after faststart
                 file_size = os.path.getsize(fixed)
-                parts = max(1, math.ceil(file_size / MAX_PART_SIZE))
-                
-                thumb = make_thumb(fixed)
+                thumb = await asyncio.to_thread(make_thumb_safe, fixed)
 
                 if parts > 1:
                     for i in range(parts):
@@ -402,33 +390,16 @@ async def handler(client, message: Message):
                             src.seek(start)
                             dst.write(src.read(end - start))
 
-                        fixed_chunk = faststart_mp4(chunk_path)
-                        thumb_chunk = make_thumb(fixed_chunk)
-                        caption = f"{file_name} [Part {i+1}/{parts}]"
-
-                        await client.send_video(
-                            "me",
-                            fixed_chunk,
-                            caption=caption,
-                            supports_streaming=True,
-                            thumb=thumb_chunk,
-                            progress=progress_bar,
-                            progress_args=(status,f"Uploading {i+1}/{parts}")
-                        )
+                        fixed_chunk = await asyncio.to_thread(smart_faststart, chunk_path)
+                        thumb_chunk = await asyncio.to_thread(make_thumb_safe, fixed_chunk)
+                        
+                        await upload_video_safe(client, "me", fixed_chunk, f"{file_name} [{i+1}/{parts}]", thumb_chunk, status, f"Up {i+1}/{parts}")
                         
                         if os.path.exists(chunk_path): os.remove(chunk_path)
                         if fixed_chunk != chunk_path and os.path.exists(fixed_chunk): os.remove(fixed_chunk)
                         if thumb_chunk: os.remove(thumb_chunk)
                 else:
-                    await client.send_video(
-                        "me",
-                        fixed,
-                        caption=file_name,
-                        supports_streaming=True,
-                        thumb=thumb,
-                        progress=progress_bar,
-                        progress_args=(status,"Uploading")
-                    )
+                    await upload_video_safe(client, "me", fixed, file_name, thumb, status, "Uploading")
 
                 if os.path.exists(f_path): os.remove(f_path)
                 if fixed != f_path and os.path.exists(fixed): os.remove(fixed)
