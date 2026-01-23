@@ -73,27 +73,30 @@ async def progress_bar(current, total, status, title):
 
 # ---------------- CORE LOGIC ----------------
 
-def get_real_filename(url, default_name):
+def get_real_filename(url, default_name, headers=None):
     """Tries to get the real filename from headers"""
     try:
-        r = requests.head(url, allow_redirects=True, timeout=5)
+        r = requests.head(url, allow_redirects=True, timeout=5, headers=headers)
         if "Content-Disposition" in r.headers:
             fname = re.findall("filename=(.+)", r.headers["Content-Disposition"])
-            if fname: 
+            if fname:
                 return fname[0].strip().replace('"', '')
     except: pass
     return default_name
 
-async def download_byte_range(url, start, end, filename):
-    """Downloads a specific part of a file"""
+async def download_byte_range(url, start, end, filename, headers=None):
+    """Downloads a specific part of a file with optional headers/tokens"""
     out_path = DOWNLOAD_DIR / filename
     # Curl is efficient for range downloads
-    cmd = [
-        "curl", "-L", "-s", 
-        "-r", f"{start}-{end}", 
-        "-o", str(out_path),
-        url
-    ]
+    cmd = ["curl", "-L", "-s", "-r", f"{start}-{end}", "-o", str(out_path)]
+
+    # Add custom headers if provided
+    if headers:
+        for key, value in headers.items():
+            cmd.extend(["-H", f"{key}: {value}"])
+
+    cmd.append(url)
+
     process = await asyncio.create_subprocess_exec(*cmd)
     await process.wait()
     return out_path if out_path.exists() else None
@@ -155,9 +158,10 @@ async def upload_video_safe(client, chat_id, path, caption, thumb, status, progr
 
 # ---------------- ALBUM PARSERS ----------------
 
-async def resolve_url(url):
+async def resolve_url(url, token=None, bearer_token=None):
     """
-    Returns a list of dictionaries: [{'url': direct_link, 'name': filename, 'size': bytes}]
+    Returns a list of dictionaries: [{'url': direct_link, 'name': filename, 'size': bytes, 'headers': {...}}]
+    Supports token/bearer token for authenticated downloads
     """
     items = []
 
@@ -171,7 +175,8 @@ async def resolve_url(url):
                     items.append({
                         "url": f"https://pixeldrain.com/api/file/{f['id']}",
                         "name": f['name'],
-                        "size": f['size']
+                        "size": f['size'],
+                        "headers": {}
                     })
         except Exception as e:
             log.error(f"Pixeldrain List Error: {e}")
@@ -184,7 +189,8 @@ async def resolve_url(url):
             items.append({
                 "url": f"https://pixeldrain.com/api/file/{file_id}",
                 "name": r.get('name', f'{file_id}.mp4'),
-                "size": r.get('size', 0)
+                "size": r.get('size', 0),
+                "headers": {}
             })
         except: pass
 
@@ -192,26 +198,37 @@ async def resolve_url(url):
     elif "gofile.io/d/" in url:
         try:
             cid = url.split("/d/")[1]
-            go = GoFile() # Assuming this class exists as per your snippet
-            # We use a dummy method or try to fetch API manually if GoFile class isn't fully compatible
-            # For now, relying on your existing logic adapted:
-            # NOTE: Getting direct links from GoFile requires tokens. 
-            # I assume your 'GoFile' class handles getting the file list.
-            # If GoFile class downloads immediately, we can't use it easily here.
-            # Below is a generic fallback logic.
+            go = GoFile()
             log.info("Detected GoFile. Using simplified single-link logic if token fails.")
         except: pass
 
-    # 4. Direct Link (Generic)
+    # 4. Direct Link (Generic) - supports token/bearer auth
     if not items:
-        # Head request to get info
         try:
-            r = requests.head(url, allow_redirects=True)
+            headers_to_use = {}
+
+            # Build auth headers
+            if bearer_token:
+                headers_to_use["Authorization"] = f"Bearer {bearer_token}"
+            elif token:
+                headers_to_use["Authorization"] = f"Token {token}"
+
+            r = requests.head(url, allow_redirects=True, headers=headers_to_use if headers_to_use else None)
             size = int(r.headers.get("content-length", 0))
-            name = get_real_filename(url, "video.mp4")
-            items.append({"url": r.url, "name": name, "size": size})
+            name = get_real_filename(url, "video.mp4", headers=headers_to_use if headers_to_use else None)
+            items.append({
+                "url": r.url,
+                "name": name,
+                "size": size,
+                "headers": headers_to_use
+            })
         except:
-            items.append({"url": url, "name": "video.mp4", "size": 0})
+            items.append({
+                "url": url,
+                "name": "video.mp4",
+                "size": 0,
+                "headers": {"Authorization": f"Bearer {bearer_token}"} if bearer_token else ({"Authorization": f"Token {token}"} if token else {})
+            })
 
     return items
 
@@ -223,14 +240,27 @@ async def handler(client, message: Message):
     if not text.startswith("http"): return
 
     status = await message.reply("Analysing link...")
-    
+
     # 1. Clean previous runs
     shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Extract token from message if provided (format: "url token_value" or "url bearer:token_value")
+    url_parts = text.split()
+    main_url = url_parts[0]
+    token = None
+    bearer_token = None
+
+    if len(url_parts) > 1:
+        token_part = url_parts[1]
+        if token_part.startswith("bearer:"):
+            bearer_token = token_part[7:]
+        else:
+            token = token_part
+
     try:
         # 2. Resolve URL (Handles Lists/Albums)
-        file_list = await resolve_url(text)
+        file_list = await resolve_url(main_url, token=token, bearer_token=bearer_token)
         
         if not file_list:
             await status.edit("❌ Could not find files.")
@@ -244,6 +274,7 @@ async def handler(client, message: Message):
             url = item["url"]
             name = re.sub(r'[^\w\-. ]', '', item["name"]) # Sanitize
             size = item["size"]
+            headers = item.get("headers", {})
 
             # Display Progress
             await status.edit(f"<b>File {index}/{total_files}</b>\nName: {name}\nSize: {format_bytes(size)}")
@@ -251,12 +282,12 @@ async def handler(client, message: Message):
             # --- CASE A: Small File (< 1.9GB) ---
             if 0 < size < MAX_CHUNK_SIZE:
                 # Download Whole
-                f_path = await download_byte_range(url, 0, size, name)
-                
+                f_path = await download_byte_range(url, 0, size, name, headers=headers if headers else None)
+
                 if f_path:
                     thumb = await asyncio.to_thread(generate_thumbnail, f_path)
                     await upload_video_safe(client, "me", f_path, name, thumb, status, "Uploading")
-                    
+
                     # Cleanup
                     os.remove(f_path)
                     if thumb and os.path.exists(thumb): os.remove(thumb)
@@ -265,25 +296,25 @@ async def handler(client, message: Message):
             else:
                 # Calculate Parts
                 parts = math.ceil(size / MAX_CHUNK_SIZE) if size > 0 else 1
-                
+
                 # If size unknown, we just guess or try downloading
-                if size == 0: 
+                if size == 0:
                     await status.edit("⚠️ Unknown size, trying simplified download...")
                     # Fallback for unknown size: standard aria2/curl without splitting (risky)
                     # But assuming we have size from Pixeldrain API usually.
-                
+
                 current_byte = 0
                 global_thumb = None
 
                 for part in range(1, parts + 1):
                     end_byte = min(current_byte + MAX_CHUNK_SIZE - 1, size - 1)
                     part_name = f"{name}.part{part:03d}.mp4"
-                    
+
                     await status.edit(f"<b>File {index}/{total_files}: {name}</b>\n"
                                       f"Processing Part {part}/{parts}")
 
                     # 1. Download Chunk
-                    chunk_path = await download_byte_range(url, current_byte, end_byte, part_name)
+                    chunk_path = await download_byte_range(url, current_byte, end_byte, part_name, headers=headers if headers else None)
                     if not chunk_path: break
 
                     # 2. Thumbnail Logic
