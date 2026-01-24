@@ -217,6 +217,16 @@ class GoFile(metaclass=GoFileMeta):
                         if child["type"] == "file":
                             name = child["name"]
                             files.append(File(child["link"], os.path.join(dir, sanitize_filename(name))))
+                        # --- ADDED RECURSION HERE ---
+                        elif child["type"] == "folder":
+                            files.extend(self.get_files(
+                                dir, 
+                                content_id=child["id"], 
+                                password=password, 
+                                includes=includes, 
+                                excludes=excludes
+                            ))
+                        # ----------------------------
                 else:
                     name = data["data"]["name"]
                     files.append(File(data["data"]["link"], os.path.join(dir, sanitize_filename(name))))
