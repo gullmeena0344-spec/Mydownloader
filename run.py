@@ -1,208 +1,94 @@
-import os
-import re
+import hashlib
 import math
-import asyncio
-import shutil
-import time
-import logging
+import os
+import stat
 import subprocess
 import requests
-from pathlib import Path
+from threading import Lock
+from pathvalidate import sanitize_filename
 
-from pyrogram import Client, filters
-from pyrogram.types import Message
+class File:
+    def __init__(self, link, dest):
+        self.link = link
+        self.dest = dest
 
-try:
-    from run import GoFile, Downloader, File
-except ImportError:
-    GoFile = None
-    Downloader = None
-    print("Warning: run.py not found.")
+class Downloader:
+    def __init__(self, token):
+        self.token = token
+        self.lock = Lock()
 
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")
+    def _ffmpeg(self):
+        return "ffmpeg"
 
-DOWNLOAD_DIR = Path("output")
-MAX_CHUNK_SIZE = 1900 * 1024 * 1024
-MIN_FREE_SPACE_MB = 500
-
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("BOT")
-
-app = Client(
-    "gofile-userbot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING
-)
-
-# ---------------- UTILS ----------------
-
-def format_bytes(size):
-    for u in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024:
-            return f"{size:.2f}{u}"
-        size /= 1024
-
-def get_progress_bar(percent, total=15):
-    filled = int(total * percent // 100)
-    return f"▰{'▰'*filled}{'▱'*(total-filled)}"
-
-async def progress_bar(current, total, status, title):
-    now = time.time()
-    if not hasattr(status, "start"):
-        status.start = now
-        status.last = 0
-    if now - status.last < 3:
-        return
-    status.last = now
-
-    percent = current * 100 / total if total else 0
-    elapsed = now - status.start
-    speed = current / elapsed if elapsed else 0
-    eta = (total - current) / speed if speed else 0
-
-    await status.edit(
-        f"<b>{title}</b>\n"
-        f"<code>{get_progress_bar(percent)} {percent:.1f}%</code>\n"
-        f"<b>Size:</b> {format_bytes(current)} / {format_bytes(total)}\n"
-        f"<b>ETA:</b> {int(eta)}s"
-    )
-
-# ---------------- THUMBNAIL (FIXED) ----------------
-
-def get_existing_or_generate_thumb(video_path):
-    jpg = f"{video_path}.jpg"
-    if os.path.exists(jpg) and os.path.getsize(jpg) > 1024:
-        return jpg
-
-    if not os.path.exists(video_path):
+    def _generate_thumb(self, video):
+        jpg = video + ".jpg"
+        if os.path.exists(jpg):
+            return jpg
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", video, "-ss", "00:00:03", "-vframes", "1", jpg],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            if os.path.exists(jpg):
+                return jpg
+        except:
+            pass
         return None
 
-    thumb = f"{video_path}.thumb.jpg"
-    try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-i", str(video_path),
-                "-ss", "00:00:03",
-                "-vframes", "1",
-                "-q:v", "2",
-                thumb
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        if os.path.exists(thumb) and os.path.getsize(thumb) > 1024:
-            return thumb
-    except:
-        pass
-    return None
+    def download(self, file, threads=1, on_part_ready=None):
+        r = requests.head(file.link, headers={"Cookie": f"accountToken={self.token}"})
+        size = int(r.headers["Content-Length"])
+        split = 2 * 1024 * 1024 * 1024
 
-# ---------------- GOFILE ----------------
+        os.makedirs(os.path.dirname(file.dest), exist_ok=True)
+        base, ext = os.path.splitext(file.dest)
 
-async def handle_gofile_logic(client, status, url):
-    go = GoFile()
-    cid = re.search(r"gofile\.io/d/([\w\-]+)", url)
-    if not cid:
-        await status.edit("❌ Invalid GoFile link")
-        return
+        parts = math.ceil(size / split)
+        for i in range(parts):
+            start = i * split
+            end = min(start + split - 1, size - 1)
 
-    files = go.get_files(str(DOWNLOAD_DIR), content_id=cid.group(1))
-    await status.edit(f"Found {len(files)} file(s)")
+            part = f"{base}.part{i+1:03d}{ext}" if parts > 1 else file.dest
+            with requests.get(
+                file.link,
+                headers={
+                    "Cookie": f"accountToken={self.token}",
+                    "Range": f"bytes={start}-{end}"
+                },
+                stream=True
+            ) as rr:
+                with open(part, "wb") as f:
+                    for c in rr.iter_content(8192):
+                        if c:
+                            f.write(c)
 
-    upload_queue = asyncio.Queue()
-    done = asyncio.Event()
-    loop = asyncio.get_running_loop()
+            if ext.lower() in [".mp4", ".mkv", ".mov", ".m4v"]:
+                self._generate_thumb(part)
 
-    def on_part_ready(path, part, total, size):
-        asyncio.run_coroutine_threadsafe(upload_queue.put((path, part, total)), loop)
+            if on_part_ready:
+                on_part_ready(part, i + 1, parts, end - start + 1)
 
-    async def download():
-        await asyncio.to_thread(
-            Downloader(token=go.token).download,
-            files[0], 1, on_part_ready
-        )
-        done.set()
+class GoFile:
+    def __init__(self):
+        self.token = ""
 
-    async def upload():
-        while True:
-            if upload_queue.empty() and done.is_set():
-                break
-            path, part, total = await upload_queue.get()
-            thumb = await asyncio.to_thread(get_existing_or_generate_thumb, path)
+    def get_files(self, dir, content_id=None):
+        if not self.token:
+            self.token = requests.post("https://api.gofile.io/accounts").json()["data"]["token"]
 
-            await client.send_video(
-                "me",
-                path,
-                caption=os.path.basename(path),
-                thumb=thumb,
-                supports_streaming=True,
-                progress=progress_bar,
-                progress_args=(status, f"UP {part}/{total}")
-            )
+        data = requests.get(
+            f"https://api.gofile.io/contents/{content_id}",
+            headers={"Authorization": f"Bearer {self.token}"}
+        ).json()
 
-            if thumb and os.path.exists(thumb):
-                os.remove(thumb)
-            if os.path.exists(path):
-                os.remove(path)
-
-    await asyncio.gather(download(), upload())
-    await status.edit("✅ GoFile done")
-
-# ---------------- GENERIC ----------------
-
-async def download_direct(url, out, status):
-    cmd = ["yt-dlp", "-f", "bv*+ba/b", "-o", str(out), url]
-    proc = await asyncio.create_subprocess_exec(*cmd)
-    await proc.wait()
-    return out.exists()
-
-async def handle_generic_logic(client, status, url):
-    name = "video.mp4"
-    path = DOWNLOAD_DIR / name
-
-    ok = await download_direct(url, path, status)
-    if not ok:
-        await status.edit("❌ Download failed")
-        return
-
-    size = path.stat().st_size
-    thumb = await asyncio.to_thread(get_existing_or_generate_thumb, path)
-
-    await client.send_video(
-        "me",
-        str(path),
-        caption=name,
-        thumb=thumb,
-        supports_streaming=True,
-        progress=progress_bar,
-        progress_args=(status, "Uploading")
-    )
-
-    if thumb and os.path.exists(thumb):
-        os.remove(thumb)
-    os.remove(path)
-
-# ---------------- MAIN ----------------
-
-@app.on_message(filters.text & (filters.private | filters.outgoing))
-async def handler(client, message: Message):
-    text = message.text.strip()
-    if not text.startswith("http"):
-        return
-
-    status = await message.reply("Processing...")
-    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-    DOWNLOAD_DIR.mkdir(exist_ok=True)
-
-    try:
-        if "gofile.io" in text:
-            await handle_gofile_logic(client, status, text)
-        else:
-            await handle_generic_logic(client, status, text)
-    finally:
-        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-
-app.run()
+        files = []
+        for c in data["data"]["children"].values():
+            if c["type"] == "file":
+                files.append(
+                    File(
+                        c["link"],
+                        os.path.join(dir, sanitize_filename(c["name"]))
+                    )
+                )
+        return files
