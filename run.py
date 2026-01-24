@@ -56,17 +56,25 @@ class Downloader:
         return i
 
     def _make_streamable(self, src, dst):
+        # Determine strict list of arguments
+        cmd = [
+            "./ffmpeg_static",
+            "-y",
+            "-i", src,
+            "-map", "0",        # Keep all streams (video, audio, subtitles, attachments/covers)
+            "-c", "copy",       # Copy streams without re-encoding
+            "-ignore_unknown",  # Ignore unknown stream types rather than failing
+        ]
+
+        # Only apply faststart to MP4/MOV/M4V containers. 
+        # Applying this to MKV/AVI can break the header/thumbnail.
+        if dst.lower().endswith(('.mp4', '.mov', '.m4v')):
+            cmd.extend(["-movflags", "+faststart"])
+        
+        cmd.append(dst)
+
         subprocess.run(
-            [
-                "./ffmpeg_static",
-                "-y",
-                "-i", src,
-                "-c:v", "copy",
-                "-c:a", "copy",
-                "-movflags", "+faststart",
-                "-metadata:s:v:0", "rotate=0",
-                dst
-            ],
+            cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=True
@@ -79,7 +87,10 @@ class Downloader:
         try:
             total_size, is_support_range = self._get_total_size(link)
 
-            part_size = 1500 * 1024 * 1024 * 1024  # 2GB
+            # --- SETTING: 1.5 GB ---
+            # 1.5 * 1024 * 1024 * 1024 bytes
+            part_size = int(1.5 * 1024 * 1024 * 1024)
+            
             needs_splitting = total_size > part_size
 
             display_name = os.path.basename(dest)
@@ -99,9 +110,14 @@ class Downloader:
 
                 self._download_range(link, 0, total_size - 1, raw_file, 0)
 
+                # Process video files
                 if ext.lower() in ['.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.m4v']:
-                    self._make_streamable(raw_file, final_file)
-                    os.remove(raw_file)
+                    try:
+                        self._make_streamable(raw_file, final_file)
+                        os.remove(raw_file)
+                    except Exception as e:
+                        logger.error(f"FFmpeg failed, keeping raw file: {e}")
+                        os.rename(raw_file, final_file)
                 else:
                     os.rename(raw_file, final_file)
 
@@ -115,11 +131,25 @@ class Downloader:
                     end = min(start + part_size - 1, total_size - 1)
 
                     raw_part = f"{base}.raw.part{i+1:03d}"
-                    final_part = f"{base}.part{i+1:03d}.mp4"
+                    
+                    # Keep extension logic consistent
+                    final_part = f"{base}.part{i+1:03d}{ext}"
 
                     self._download_range(link, start, end, raw_part, i)
-                    self._make_streamable(raw_part, final_part)
-                    os.remove(raw_part)
+                    
+                    try:
+                        # Only Part 1 is guaranteed to work with ffmpeg copy due to headers
+                        if i == 0:
+                            self._make_streamable(raw_part, final_part)
+                        else:
+                            # Part 2+ usually lacks headers, just rename
+                            os.rename(raw_part, final_part)
+                    except:
+                        if os.path.exists(raw_part):
+                            os.rename(raw_part, final_part)
+
+                    if os.path.exists(raw_part):
+                         os.remove(raw_part)
 
                     if on_part_ready:
                         on_part_ready(final_part, i + 1, parts, end - start + 1)
@@ -217,7 +247,6 @@ class GoFile(metaclass=GoFileMeta):
                         if child["type"] == "file":
                             name = child["name"]
                             files.append(File(child["link"], os.path.join(dir, sanitize_filename(name))))
-                        # --- ADDED RECURSION HERE ---
                         elif child["type"] == "folder":
                             files.extend(self.get_files(
                                 dir, 
@@ -226,7 +255,6 @@ class GoFile(metaclass=GoFileMeta):
                                 includes=includes, 
                                 excludes=excludes
                             ))
-                        # ----------------------------
                 else:
                     name = data["data"]["name"]
                     files.append(File(data["data"]["link"], os.path.join(dir, sanitize_filename(name))))
