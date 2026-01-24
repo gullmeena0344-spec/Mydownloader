@@ -4,6 +4,7 @@ import hashlib
 import logging
 import math
 import os
+import stat
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import subprocess
@@ -33,6 +34,18 @@ class Downloader:
         self.progress_lock = Lock()
         self.progress_bar = None
 
+    def _ensure_executable(self, path):
+        if os.path.exists(path):
+            st = os.stat(path)
+            os.chmod(path, st.st_mode | stat.S_IEXEC)
+
+    def _get_ffmpeg_path(self):
+        local_bin = "./ffmpeg_static"
+        if os.path.exists(local_bin):
+            self._ensure_executable(local_bin)
+            return local_bin
+        return "ffmpeg"
+
     def _get_total_size(self, link):
         r = requests.head(link, headers={"Cookie": f"accountToken={self.token}"})
         r.raise_for_status()
@@ -54,77 +67,61 @@ class Downloader:
                                 self.progress_bar.update(len(chunk))
         return i
 
-    def _generate_thumbnail(self, video_path):
+    def _generate_external_thumbnail(self, video_path):
         """
-        Extracts a thumbnail image from the video.
-        Returns the path to the jpg file.
+        Creates a small JPG file next to the video.
+        Uses negligible disk space (100KB).
         """
-        ffmpeg_bin = "./ffmpeg_static"
-        if not os.path.exists(ffmpeg_bin):
-            ffmpeg_bin = "ffmpeg"
-
+        ffmpeg_bin = self._get_ffmpeg_path()
         thumb_path = video_path + ".jpg"
         
         try:
             # Extract frame at 00:00:05
-            subprocess.run([
+            cmd = [
                 ffmpeg_bin, "-y", 
                 "-ss", "00:00:05", 
                 "-i", video_path, 
                 "-frames:v", "1", 
                 "-q:v", "2", 
                 thumb_path
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            
-            if os.path.exists(thumb_path):
-                return thumb_path
-        except Exception as e:
-            logger.warning(f"Could not generate external thumbnail: {e}")
-        
-        return None
-
-    def _embed_thumbnail_internal(self, video_path, thumb_path):
-        """
-        Embeds the JPG into the MP4 container.
-        """
-        ffmpeg_bin = "./ffmpeg_static"
-        if not os.path.exists(ffmpeg_bin):
-            ffmpeg_bin = "ffmpeg"
-
-        temp_output = video_path + ".temp.mp4"
-
-        try:
-            cmd = [
-                ffmpeg_bin, "-y",
-                "-i", video_path,
-                "-i", thumb_path,
-                "-map", "0",
-                "-map", "1",
-                "-c", "copy",
-                "-disposition:v:1", "attached_pic",
-                "-movflags", "+faststart",
-                "-ignore_unknown",
-                temp_output
             ]
-
             subprocess.run(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                cmd, 
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.DEVNULL, 
                 check=True
             )
-            
-            # If successful, replace original
-            if os.path.exists(temp_output):
-                os.remove(video_path)
-                os.rename(temp_output, video_path)
-                return True
+            return thumb_path if os.path.exists(thumb_path) else None
         except Exception as e:
-            logger.error(f"Embedding failed (likely disk full): {e}")
-            if os.path.exists(temp_output):
-                os.remove(temp_output)
+            logger.warning(f"Could not generate jpg: {e}")
+            return None
+
+    def _embed_thumbnail(self, src, dst, thumb_path):
+        """
+        Embeds the JPG into the video.
+        WARNING: This duplicates the file size temporarily.
+        """
+        ffmpeg_bin = self._get_ffmpeg_path()
         
-        return False
+        cmd = [
+            ffmpeg_bin, "-y",
+            "-i", src,
+            "-i", thumb_path,
+            "-map", "0",
+            "-map", "1",
+            "-c", "copy",
+            "-disposition:v:1", "attached_pic",
+            "-movflags", "+faststart",
+            "-ignore_unknown",
+            dst
+        ]
+
+        subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True
+        )
 
     def download(self, file: File, num_threads=1, on_part_ready=None):
         link = file.link
@@ -133,12 +130,15 @@ class Downloader:
         try:
             total_size, is_support_range = self._get_total_size(link)
 
-            # --- LIMITS ---
-            # 1.6 GB Limit: Files smaller than this get the thumbnail EMBEDDED (Best quality).
-            # Files larger than this get a SEPARATE .jpg file (Safe for disk).
-            embed_limit = int(1.6 * 1024 * 1024 * 1024)
+            # --- ULTRA LOW DISK SETTINGS ---
             
-            # 2.0 GB Limit: Telegram Standard Upload Limit.
+            # 1. Processing Limit: 500 MB
+            # We ONLY embed thumbnails for files smaller than 500MB.
+            # Doing this for larger files risks "Disk Full".
+            process_limit = int(0.5 * 1024 * 1024 * 1024)
+            
+            # 2. Telegram Split Limit: 2.0 GB
+            # Must split here or upload fails.
             split_limit = int(2.0 * 1024 * 1024 * 1024)
             
             needs_splitting = total_size > split_limit
@@ -155,29 +155,41 @@ class Downloader:
             base, ext = os.path.splitext(dest)
 
             if not needs_splitting:
-                # --- SINGLE FILE ---
-                self._download_range(link, 0, total_size - 1, dest, 0)
+                # --- SINGLE FILE DOWNLOAD ---
                 
-                # Check if video format
-                if ext.lower() in ['.mp4', '.mkv', '.avi', '.mov', '.m4v']:
-                    # 1. Always generate a JPG first
-                    thumb_jpg = self._generate_thumbnail(dest)
+                # A. Tiny Files (< 500MB): Download -> Embed Thumb -> Finish
+                if total_size <= process_limit and ext.lower() in ['.mp4', '.mkv', '.avi', '.mov', '.m4v']:
+                    raw_file = f"{base}.raw{ext}"
+                    final_file = dest
                     
-                    # 2. If small enough, try to embed it
-                    if total_size <= embed_limit and thumb_jpg:
-                        success = self._embed_thumbnail_internal(dest, thumb_jpg)
-                        if success:
-                            # If embedded successfully, we don't need the external jpg anymore
-                            os.remove(thumb_jpg)
+                    self._download_range(link, 0, total_size - 1, raw_file, 0)
+
+                    try:
+                        thumb_jpg = self._generate_external_thumbnail(raw_file)
+                        if thumb_jpg:
+                            self._embed_thumbnail(raw_file, final_file, thumb_jpg)
+                            # Cleanup raw and thumb after embedding
+                            if os.path.exists(raw_file): os.remove(raw_file)
+                            if os.path.exists(thumb_jpg): os.remove(thumb_jpg)
+                        else:
+                            os.rename(raw_file, final_file)
+                    except Exception:
+                        if os.path.exists(raw_file): os.rename(raw_file, final_file)
+
+                # B. Medium Files (500MB - 2.0GB): Download -> Generate External JPG -> Finish
+                else:
+                    self._download_range(link, 0, total_size - 1, dest, 0)
                     
-                    # If file was > 1.6GB, we skip embedding. 
-                    # We leave the .jpg file there. The uploader bot should pick it up.
+                    # Generate external JPG (uses negligible space)
+                    # Your uploader bot should detect "video.mp4" and "video.mp4.jpg"
+                    if ext.lower() in ['.mp4', '.mkv', '.avi', '.mov', '.m4v']:
+                        self._generate_external_thumbnail(dest)
 
                 if on_part_ready:
                     on_part_ready(dest, 1, 1, total_size)
 
             else:
-                # --- SPLIT FILES ---
+                # --- SPLIT DOWNLOAD (> 2.0GB) ---
                 parts = math.ceil(total_size / split_limit)
 
                 for i in range(parts):
@@ -186,14 +198,14 @@ class Downloader:
 
                     final_part = f"{base}.part{i+1:03d}{ext}"
                     self._download_range(link, start, end, final_part, i)
-
-                    # Try to generate thumbnail ONLY for Part 1 (which has the header)
+                    
+                    # Generate external JPG only for Part 1
                     if i == 0 and ext.lower() in ['.mp4', '.mkv', '.avi', '.mov', '.m4v']:
-                        # We just leave the .jpg there for the uploader
-                        self._generate_thumbnail(final_part)
+                        self._generate_external_thumbnail(final_part)
 
                     if on_part_ready:
                         on_part_ready(final_part, i + 1, parts, end - start + 1)
+                        # Your main.py should delete 'final_part' immediately after this returns
 
             self.progress_bar.close()
 
@@ -201,6 +213,7 @@ class Downloader:
             if self.progress_bar:
                 self.progress_bar.close()
             logger.error(f"failed to download ({e}): {dest} ({link})")
+            # Cleanup
             if os.path.exists(dest):
                 try: os.remove(dest)
                 except: pass
