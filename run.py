@@ -7,7 +7,6 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import subprocess
-
 import requests
 from pathvalidate import sanitize_filename
 import shutil
@@ -56,18 +55,20 @@ class Downloader:
         return i
 
     def _make_streamable(self, src, dst):
-        # Determine strict list of arguments
+        # Tries to use local ffmpeg_static, falls back to system ffmpeg if needed
+        ffmpeg_bin = "./ffmpeg_static"
+        if not os.path.exists(ffmpeg_bin):
+            ffmpeg_bin = "ffmpeg"
+
         cmd = [
-            "./ffmpeg_static",
+            ffmpeg_bin,
             "-y",
             "-i", src,
-            "-map", "0",        # Keep all streams (video, audio, subtitles, attachments/covers)
-            "-c", "copy",       # Copy streams without re-encoding
-            "-ignore_unknown",  # Ignore unknown stream types rather than failing
+            "-map", "0",        
+            "-c", "copy",       
+            "-ignore_unknown",  
         ]
 
-        # Only apply faststart to MP4/MOV/M4V containers. 
-        # Applying this to MKV/AVI can break the header/thumbnail.
         if dst.lower().endswith(('.mp4', '.mov', '.m4v')):
             cmd.extend(["-movflags", "+faststart"])
         
@@ -87,9 +88,12 @@ class Downloader:
         try:
             total_size, is_support_range = self._get_total_size(link)
 
-            # --- SETTING: 1.5 GB ---
-            # 1.5 * 1024 * 1024 * 1024 bytes
-            part_size = int(1.5 * 1024 * 1024 * 1024)
+            # --- LIMITS FOR 4GB DISK ---
+            # 1.9 GB Limit for FFmpeg (1.9 in + 1.9 out = 3.8GB used)
+            ffmpeg_limit = int(1.9 * 1024 * 1024 * 1024)
+            
+            # 2.5 GB Limit for Splitting (Files bigger than this get split)
+            part_size = int(2.5 * 1024 * 1024 * 1024)
             
             needs_splitting = total_size > part_size
 
@@ -105,51 +109,45 @@ class Downloader:
             base, ext = os.path.splitext(dest)
 
             if not needs_splitting:
-                raw_file = f"{base}.raw{ext}"
-                final_file = dest
+                # File is smaller than 2.5GB. We will have a working thumbnail.
+                
+                # Check if we can safely use FFmpeg (File < 1.9GB)
+                if total_size <= ffmpeg_limit and ext.lower() in ['.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.m4v']:
+                    raw_file = f"{base}.raw{ext}"
+                    final_file = dest
+                    
+                    # Download to raw
+                    self._download_range(link, 0, total_size - 1, raw_file, 0)
 
-                self._download_range(link, 0, total_size - 1, raw_file, 0)
-
-                # Process video files
-                if ext.lower() in ['.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.m4v']:
                     try:
                         self._make_streamable(raw_file, final_file)
-                        os.remove(raw_file)
+                        os.remove(raw_file) # Delete raw to free space
                     except Exception as e:
-                        logger.error(f"FFmpeg failed, keeping raw file: {e}")
-                        os.rename(raw_file, final_file)
+                        logger.error(f"FFmpeg failed or not found, keeping raw file: {e}")
+                        if os.path.exists(raw_file):
+                            os.rename(raw_file, final_file)
                 else:
-                    os.rename(raw_file, final_file)
+                    # File is between 1.9GB and 2.5GB.
+                    # Too big for FFmpeg double-copy, but small enough to not split.
+                    # Download directly to final filename.
+                    self._download_range(link, 0, total_size - 1, dest, 0)
 
                 if on_part_ready:
-                    on_part_ready(final_file, 1, 1, total_size)
+                    on_part_ready(dest, 1, 1, total_size)
+
             else:
+                # File is larger than 2.5GB. Must split to avoid 4GB disk crash.
                 parts = math.ceil(total_size / part_size)
 
                 for i in range(parts):
                     start = i * part_size
                     end = min(start + part_size - 1, total_size - 1)
 
-                    raw_part = f"{base}.raw.part{i+1:03d}"
-                    
-                    # Keep extension logic consistent
+                    # Consistent naming
                     final_part = f"{base}.part{i+1:03d}{ext}"
 
-                    self._download_range(link, start, end, raw_part, i)
-                    
-                    try:
-                        # Only Part 1 is guaranteed to work with ffmpeg copy due to headers
-                        if i == 0:
-                            self._make_streamable(raw_part, final_part)
-                        else:
-                            # Part 2+ usually lacks headers, just rename
-                            os.rename(raw_part, final_part)
-                    except:
-                        if os.path.exists(raw_part):
-                            os.rename(raw_part, final_part)
-
-                    if os.path.exists(raw_part):
-                         os.remove(raw_part)
+                    # Direct download, no FFmpeg for split parts
+                    self._download_range(link, start, end, final_part, i)
 
                     if on_part_ready:
                         on_part_ready(final_part, i + 1, parts, end - start + 1)
@@ -160,6 +158,9 @@ class Downloader:
             if self.progress_bar:
                 self.progress_bar.close()
             logger.error(f"failed to download ({e}): {dest} ({link})")
+            if os.path.exists(dest):
+                try: os.remove(dest)
+                except: pass
             raise
 
 class GoFileMeta(type):
