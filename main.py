@@ -99,46 +99,34 @@ def get_duration(file_path):
         log.error(f"Error getting duration: {e}")
     return 0
 
-def faststart_mp4(src):
-    """Optimizes video for streaming"""
-    dst = src + ".fast.mp4"
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", dst],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-    return dst if os.path.exists(dst) else src
-
 def generate_thumbnail(video_path):
     """
-    Robust thumbnail generator that works for split parts.
-    Calculates timestamp based on duration to avoid black screens.
+    Robust thumbnail generator.
     """
     thumb_path = f"{video_path}.jpg"
+    
+    # 1. Check if run.py already created a thumbnail (Zero-Cost)
+    if os.path.exists(thumb_path):
+        return thumb_path
+
     if not os.path.exists(video_path): return None
 
-    # Get video duration to find a valid timestamp
+    # 2. If not, generate one
     duration = get_duration(video_path)
-    
-    # Logic: Try 10% into the video, then 50%, then 2 seconds
-    # This prevents taking thumbnails at 0s (often black) or times that don't exist
     timestamps = []
     if duration > 0:
-        timestamps.append(f"{duration * 0.10:.2f}") # 10% mark
-        timestamps.append(f"{duration * 0.50:.2f}") # Middle
-        timestamps.append("2") # 2 seconds fallback
+        timestamps.append(f"{duration * 0.10:.2f}") 
+        timestamps.append(f"{duration * 0.50:.2f}") 
+        timestamps.append("2") 
     else:
         timestamps = ["00:00:02", "00:00:00"]
 
     for ss in timestamps:
         try:
-            # -ss before -i is faster, but after -i is more accurate. 
-            # For thumbnails, we put -ss after -i to ensure we get the frame exactly at that time
             subprocess.run(
                 ["ffmpeg", "-y", "-i", str(video_path), "-ss", str(ss), "-vframes", "1", thumb_path],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            # Check if file exists and is not empty (larger than 1KB)
             if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 1024:
                 return thumb_path
         except: 
@@ -149,7 +137,7 @@ def generate_thumbnail(video_path):
 # ---------------- SPECIFIC HANDLERS ----------------
 
 async def handle_gofile_logic(client, message, status, url):
-    """GoFile logic"""
+    """GoFile logic - Optimized for run.py integration"""
     try:
         if not GoFile:
             await status.edit("❌ run.py is missing!")
@@ -169,8 +157,9 @@ async def handle_gofile_logic(client, message, status, url):
         await status.edit(f"Found {len(files)} file(s) on GoFile. Processing...")
 
         for idx, file in enumerate(files, 1):
+            # Check free space before starting new download
             if get_free_space() < MIN_FREE_SPACE_MB * 1024 * 1024:
-                await status.edit("❌ Disk Full.")
+                await status.edit("❌ Disk Full (Safety Limit Reached).")
                 break
 
             file_name = os.path.basename(file.dest)
@@ -185,6 +174,7 @@ async def handle_gofile_logic(client, message, status, url):
 
             async def download_task():
                 try:
+                    # Run the Downloader from run.py
                     await asyncio.to_thread(
                         Downloader(token=go.token).download,
                         file, 1, on_part_ready
@@ -204,18 +194,20 @@ async def handle_gofile_logic(client, message, status, url):
                         if get_task in done:
                             path, part_num, total_parts = await get_task
                             if wait_task in pending: wait_task.cancel()
+                            
                             if not os.path.exists(path): continue
 
                             caption = f"{file_name} [Part {part_num}/{total_parts}]" if total_parts > 1 else file_name
                             await status.edit(f"[{idx}/{len(files)}] Uploading Part {part_num}/{total_parts}...")
 
-                            fixed_path = await asyncio.to_thread(faststart_mp4, str(path))
-                            thumb_path = await asyncio.to_thread(generate_thumbnail, fixed_path)
+                            # --- CHANGED: Don't run faststart again. run.py did it. ---
+                            # Check if run.py generated an external thumbnail (.jpg)
+                            thumb_path = await asyncio.to_thread(generate_thumbnail, path)
 
                             try:
                                 await client.send_video(
                                     "me",
-                                    video=fixed_path,
+                                    video=path, # Upload path directly
                                     caption=caption,
                                     supports_streaming=True,
                                     thumb=thumb_path,
@@ -225,10 +217,10 @@ async def handle_gofile_logic(client, message, status, url):
                             except Exception as e:
                                 log.error(f"Send Error: {e}")
 
-                            # Clean up
+                            # Clean up immediately to free 4GB disk
                             if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
-                            if fixed_path and os.path.exists(fixed_path): os.remove(fixed_path)
-                            if path and os.path.exists(path) and path != fixed_path: os.remove(path)
+                            if path and os.path.exists(path): os.remove(path)
+                            
                         else:
                             if get_task in pending: get_task.cancel()
                             if upload_queue.empty(): break
@@ -247,7 +239,7 @@ async def handle_gofile_logic(client, message, status, url):
 # ---------------- GENERIC HANDLERS ----------------
 
 async def download_direct_any(url, out_path, status):
-    """Direct link or m3u8 (yt-dlp) with Download Progress Bar"""
+    """Direct link or m3u8 (yt-dlp)"""
     cmd = [
         "yt-dlp",
         "-f", "bv*+ba/b",
@@ -264,9 +256,7 @@ async def download_direct_any(url, out_path, status):
         stderr=asyncio.subprocess.PIPE
     )
 
-    # Regex for yt-dlp output
     pattern = re.compile(r'\[download\]\s+(\d+\.?\d*)%\s+of\s+(?:~)?(\d+\.?\d+)(\w+)\s+at\s+([^\s]+)\s+ETA\s+([^\s]+)')
-    
     last_update = 0
     filename = out_path.name
     
@@ -280,7 +270,7 @@ async def download_direct_any(url, out_path, status):
             
             if match:
                 now = time.time()
-                if now - last_update > 3: # Update every 3 seconds
+                if now - last_update > 3:
                     percent = float(match.group(1))
                     total_val = float(match.group(2))
                     unit = match.group(3)
@@ -330,6 +320,10 @@ async def handle_generic_logic(client, message, status, url):
 
     total = len(file_list)
     for idx, item in enumerate(file_list, 1):
+        if get_free_space() < MIN_FREE_SPACE_MB * 1024 * 1024:
+            await status.edit("❌ Disk Full.")
+            break
+
         name = re.sub(r'[^\w\-. ]', '', item["name"])
         path = DOWNLOAD_DIR / name
 
@@ -365,9 +359,12 @@ async def handle_generic_logic(client, message, status, url):
         duration = await asyncio.to_thread(get_duration, path)
         base = path.with_suffix("")
         
+        # NOTE: Splitting requires extra disk space. On 4GB disk, 
+        # a 2.5GB file will fail here (2.5GB downloaded + 2GB split parts > 4GB).
+        # But for direct links we don't have run.py's streaming range downloader.
+        
         if duration > 0:
-            # Use 1.85GB to be safe
-            SAFE_TARGET = 1850 * 1024 * 1024 
+            SAFE_TARGET = 1900 * 1024 * 1024 
             segment_time = int((SAFE_TARGET / size) * duration)
             if segment_time < 30: segment_time = 30
             
@@ -388,12 +385,12 @@ async def handle_generic_logic(client, message, status, url):
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         await proc.communicate()
         
+        # Delete original IMMEDIATELY to free space for uploading parts
+        os.remove(path)
+
         if proc.returncode != 0:
             await status.edit("❌ Error splitting video.")
-            os.remove(path)
             continue
-
-        os.remove(path) # Remove original
 
         parts = sorted(path.parent.glob(f"{base.name}.part*.mp4"))
         
@@ -405,7 +402,6 @@ async def handle_generic_logic(client, message, status, url):
             part_name = f"{name} [Part {i}/{len(parts)}]"
             await status.edit(f"[{idx}/{total}] Uploading Part {i}/{len(parts)}...")
             
-            # Generate thumb specifically for this part
             thumb = await asyncio.to_thread(generate_thumbnail, part)
             
             try:
