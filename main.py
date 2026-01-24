@@ -83,6 +83,20 @@ async def progress_bar(current, total, status, title):
 
 # ---------------- FFMPEG HELPERS ----------------
 
+def get_duration(file_path):
+    """Gets video duration in seconds using ffprobe"""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "format=duration", "-of",
+            "default=noprint_wrappers=1:nokey=1", str(file_path)
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return float(result.stdout.strip())
+    except Exception as e:
+        log.error(f"Error getting duration: {e}")
+        return 0
+
 def faststart_mp4(src):
     """Optimizes video for streaming"""
     dst = src + ".fast.mp4"
@@ -208,19 +222,68 @@ async def handle_gofile_logic(client, message, status, url):
 
 # ---------------- GENERIC HANDLERS ----------------
 
-async def download_direct_any(url, out_path):
-    """Direct link or m3u8 (yt-dlp)"""
+async def download_direct_any(url, out_path, status):
+    """Direct link or m3u8 (yt-dlp) with Progress Bar"""
     cmd = [
         "yt-dlp",
         "-f", "bv*+ba/b",
         "--merge-output-format", "mp4",
         "--no-playlist",
+        "--newline",  # Vital for reading progress
         "-o", str(out_path),
         url
     ]
-    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-    await proc.wait()
-    return proc.returncode == 0 and out_path.exists()
+    
+    # Start subprocess with pipes
+    process = await asyncio.create_subprocess_exec(
+        *cmd, 
+        stdout=asyncio.subprocess.PIPE, 
+        stderr=asyncio.subprocess.PIPE
+    )
+
+    # Regex to capture yt-dlp progress
+    # Example: [download]  45.0% of 100.00MiB at 12.34MiB/s ETA 00:30
+    pattern = re.compile(r'\[download\]\s+(\d+\.?\d*)%\s+of\s+(?:~)?(\d+\.?\d+)(\w+)\s+at\s+([^\s]+)\s+ETA\s+([^\s]+)')
+    
+    last_update = 0
+    filename = out_path.name
+    
+    # Read stdout line by line
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            break
+            
+        try:
+            line_decoded = line.decode().strip()
+            match = pattern.search(line_decoded)
+            
+            if match:
+                now = time.time()
+                # Update every 3 seconds to avoid FloodWait
+                if now - last_update > 3:
+                    percent = float(match.group(1))
+                    total_val = float(match.group(2))
+                    unit = match.group(3)
+                    speed = match.group(4)
+                    eta = match.group(5)
+                    
+                    # Calculate current size for display "X / Y"
+                    current_val = total_val * (percent / 100)
+                    
+                    msg = (
+                        f"<b>Downloading: {filename}</b>\n"
+                        f"<code>{get_progress_bar(percent)} {percent}%</code>\n"
+                        f"<b>Size:</b> {current_val:.2f}{unit} / {total_val}{unit}\n"
+                        f"<b>Speed:</b> {speed} | <b>ETA:</b> {eta}"
+                    )
+                    await status.edit(msg)
+                    last_update = now
+        except Exception as e:
+            log.debug(f"Progress parse error: {e}")
+
+    await process.wait()
+    return process.returncode == 0 and out_path.exists()
 
 async def resolve_generic_url(url):
     items = []
@@ -254,15 +317,18 @@ async def handle_generic_logic(client, message, status, url):
         name = re.sub(r'[^\w\-. ]', '', item["name"])
         path = DOWNLOAD_DIR / name
 
-        await status.edit(f"[{idx}/{total}] Downloading: {name}")
-        ok = await download_direct_any(item["url"], path)
+        await status.edit(f"[{idx}/{total}] Downloading: {name}...")
+        
+        # Pass 'status' to allow download progress updates
+        ok = await download_direct_any(item["url"], path, status)
+        
         if not ok:
             await status.edit("❌ Download failed.")
             continue
 
         size = os.path.getsize(path)
 
-        # Small file
+        # --- Small file (<1.9GB) ---
         if size <= MAX_CHUNK_SIZE:
             thumb = await asyncio.to_thread(generate_thumbnail, path)
             await client.send_video("me", str(path), caption=name, thumb=thumb, supports_streaming=True, progress=progress_bar, progress_args=(status, "Uploading"))
@@ -270,20 +336,73 @@ async def handle_generic_logic(client, message, status, url):
             os.remove(path)
             continue
 
-        # Large file
+        # --- Large file (>1.9GB) - FIXED SPLIT LOGIC ---
+        await status.edit(f"[{idx}/{total}] File > 1.9GB. Splitting...")
+        
+        duration = await asyncio.to_thread(get_duration, path)
         base = path.with_suffix("")
-        subprocess.run([
-            "ffmpeg", "-i", str(path), "-map", "0", "-c", "copy",
-            "-f", "segment", "-segment_size", str(MAX_CHUNK_SIZE),
-            "-reset_timestamps", "1", f"{base}.part%03d.mp4"
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        os.remove(path)
+        
+        if duration > 0:
+            # Logic: (Target Size / Total Size) * Total Duration
+            # Use 1.85GB target to be safe
+            SAFE_TARGET = 1850 * 1024 * 1024 
+            segment_time = int((SAFE_TARGET / size) * duration)
+            if segment_time < 30: segment_time = 30 # Avoid tiny chunks
+            
+            cmd = [
+                "ffmpeg", "-i", str(path), "-c", "copy", "-map", "0",
+                "-f", "segment", 
+                "-segment_time", str(segment_time), 
+                "-reset_timestamps", "1", 
+                f"{base}.part%03d.mp4"
+            ]
+        else:
+            # Fallback if duration fails: Binary split
+            await status.edit("⚠️ Metadata error. Using binary split.")
+            cmd = [
+                "split", "-b", "1900M", "--numeric-suffixes=1", 
+                "--additional-suffix=.mp4", str(path), f"{base}.part"
+            ]
 
+        # Run split
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, err = await proc.communicate()
+        
+        if proc.returncode != 0:
+            log.error(f"Split Error: {err.decode()}")
+            await status.edit("❌ Error splitting video.")
+            os.remove(path)
+            continue
+
+        os.remove(path) # Remove original
+
+        # Upload Parts
         parts = sorted(path.parent.glob(f"{base.name}.part*.mp4"))
+        
+        if not parts:
+            await status.edit("❌ Splitting produced no output files.")
+            continue
+
         for i, part in enumerate(parts, 1):
+            part_name = f"{name} [Part {i}/{len(parts)}]"
+            await status.edit(f"[{idx}/{total}] Uploading Part {i}/{len(parts)}...")
+            
             thumb = await asyncio.to_thread(generate_thumbnail, part)
-            await client.send_video("me", str(part), caption=f"{name} [{i}/{len(parts)}]", thumb=thumb, supports_streaming=True, progress=progress_bar, progress_args=(status, f"Uploading {i}/{len(parts)}"))
-            if thumb: os.remove(thumb)
+            try:
+                await client.send_video(
+                    "me", 
+                    str(part), 
+                    caption=part_name, 
+                    thumb=thumb, 
+                    supports_streaming=True, 
+                    progress=progress_bar, 
+                    progress_args=(status, f"UP: {i}/{len(parts)}")
+                )
+            except Exception as e:
+                log.error(f"Upload error part {i}: {e}")
+                await asyncio.sleep(5)
+
+            if thumb and os.path.exists(thumb): os.remove(thumb)
             os.remove(part)
 
     await status.edit("✅ Done!")
