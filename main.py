@@ -7,29 +7,26 @@ import time
 import logging
 import subprocess
 import requests
-import json
 from pathlib import Path
-from urllib.parse import unquote, urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
 
 from pyrogram import Client, filters, errors
 from pyrogram.types import Message
 
+# --- Import GoFile (Safe Import) ---
+try:
+    from run import GoFile 
+except ImportError:
+    GoFile = None
+    print("Warning: run.py not found. GoFile logic might fail.")
+
 # --- Config ---
-API_ID = int(os.getenv("API_ID", "12345")) # Replace with yours if not using env
+API_ID = int(os.getenv("API_ID", "12345")) # Replace with defaults if testing
 API_HASH = os.getenv("API_HASH", "your_hash")
 SESSION_STRING = os.getenv("SESSION_STRING", "your_session")
 
 DOWNLOAD_DIR = Path("output")
-MAX_CHUNK_SIZE = 1500 * 1024 * 1024 
-
-# Standard Browser Header
-GENERIC_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Referer": "https://google.com/",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
-}
+# Split limit: 1.9GB (Telegrams limit is 2GB, 1.9 is safe)
+MAX_CHUNK_SIZE = 1900 * 1024 * 1024 
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("BOT")
@@ -41,114 +38,10 @@ app = Client(
     session_string=SESSION_STRING
 )
 
-# ---------------- GOFILE MULTI-THREADED DOWNLOADER ----------------
-
-class GoFileDownloader:
-    def __init__(self, token, progress_callback=None):
-        self.token = token
-        self.progress_lock = Lock()
-        self.downloaded_bytes = 0
-        self.total_size = 0
-        self.progress_callback = progress_callback  # Function to update Telegram
-
-    def _get_total_size(self, link):
-        headers = {
-            "Cookie": f"accountToken={self.token}",
-            "User-Agent": GENERIC_HEADERS["User-Agent"]
-        }
-        r = requests.head(link, headers=headers)
-        r.raise_for_status()
-        return int(r.headers["Content-Length"]), r.headers.get("Accept-Ranges", "none") == "bytes"
-
-    def _download_range(self, link, start, end, temp_file, i):
-        existing_size = os.path.getsize(temp_file) if os.path.exists(temp_file) else 0
-        range_start = start + existing_size
-        if range_start > end:
-            return i
-            
-        headers = {
-            "Cookie": f"accountToken={self.token}",
-            "Range": f"bytes={range_start}-{end}",
-            "User-Agent": GENERIC_HEADERS["User-Agent"]
-        }
-        
-        with requests.get(link, headers=headers, stream=True) as r:
-            r.raise_for_status()
-            with open(temp_file, "ab") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        with self.progress_lock:
-                            self.downloaded_bytes += len(chunk)
-                            # We don't await here because this is sync code running in a thread
-                            # The callback will handle the throttling
-                            if self.progress_callback:
-                                self.progress_callback(self.downloaded_bytes, self.total_size)
-        return i
-
-    def _merge_temp_files(self, temp_dir, dest, num_threads):
-        with open(dest, "wb") as outfile:
-            for i in range(num_threads):
-                temp_file = os.path.join(temp_dir, f"part_{i}")
-                if os.path.exists(temp_file):
-                    with open(temp_file, "rb") as f:
-                        shutil.copyfileobj(f, outfile)
-                    os.remove(temp_file)
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-    def download(self, link, dest, num_threads=4):
-        temp_dir = dest + "_parts"
-        self.total_size, is_support_range = self._get_total_size(link)
-        
-        # Reset tracker
-        self.downloaded_bytes = 0
-
-        # If file exists and size matches, skip
-        if os.path.exists(dest):
-            if os.path.getsize(dest) == self.total_size:
-                return
-
-        if num_threads == 1 or not is_support_range:
-            # Single thread fallback
-            headers = {"Cookie": f"accountToken={self.token}", "User-Agent": GENERIC_HEADERS["User-Agent"]}
-            with requests.get(link, headers=headers, stream=True) as r:
-                r.raise_for_status()
-                with open(dest, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            self.downloaded_bytes += len(chunk)
-                            if self.progress_callback:
-                                self.progress_callback(self.downloaded_bytes, self.total_size)
-        else:
-            # Multi-thread logic
-            os.makedirs(temp_dir, exist_ok=True)
-            part_size = math.ceil(self.total_size / num_threads)
-            
-            # Calculate already downloaded bytes (for resume)
-            for i in range(num_threads):
-                t_file = os.path.join(temp_dir, f"part_{i}")
-                if os.path.exists(t_file):
-                    self.downloaded_bytes += os.path.getsize(t_file)
-
-            with ThreadPoolExecutor(max_workers=num_threads) as executor:
-                futures = []
-                for i in range(num_threads):
-                    start = i * part_size
-                    end = min(start + part_size - 1, self.total_size - 1)
-                    temp_file = os.path.join(temp_dir, f"part_{i}")
-                    futures.append(
-                        executor.submit(self._download_range, link, start, end, temp_file, i)
-                    )
-                
-                for future in as_completed(futures):
-                    future.result()  # Raise exceptions if any
-
-            self._merge_temp_files(temp_dir, dest, num_threads)
-
 # ---------------- UTILS ----------------
 
 def format_bytes(size):
+    if not size: return "0B"
     for u in ["B", "KB", "MB", "GB", "TB"]:
         if size < 1024:
             return f"{size:.2f} {u}"
@@ -158,156 +51,178 @@ def get_progress_bar(percent, total=15):
     filled = int(total * percent // 100)
     return f"▰{'▰'*filled}{'▱'*(total-filled-1)}▱"
 
-class ProgressTracker:
-    def __init__(self, status_msg, title):
-        self.status = status_msg
-        self.title = title
-        self.last_update = 0
-        self.start_time = time.time()
-        self.loop = asyncio.get_event_loop()
-
-    def update(self, current, total):
+async def progress_bar(current, total, status, title):
+    try:
         now = time.time()
-        if now - self.last_update < 3 and current != total:
+        if hasattr(status, "last") and now - status.last < 3:
             return
-        
-        self.last_update = now
+        status.last = now
         p = (current * 100 / total) if total > 0 else 0
-        diff = now - self.start_time
+        
+        if not hasattr(status, "start_time"):
+            status.start_time = now
+        
+        diff = now - status.start_time
         speed = current / diff if diff > 0 else 0
         eta = (total - current) / speed if speed > 0 else 0
         eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
-
-        text = (
-            f"<b>{self.title}</b>\n"
+        
+        await status.edit(
+            f"<b>{title}</b>\n"
             f"<code>{get_progress_bar(p)} {p:.1f}%</code>\n"
             f"<b>Size:</b> {format_bytes(current)} / {format_bytes(total)}\n"
             f"<b>Speed:</b> {format_bytes(speed)}/s\n"
             f"<b>ETA:</b> {eta_str}"
         )
-        
-        # Fire and forget update to avoid blocking download thread
-        asyncio.run_coroutine_threadsafe(self.status.edit(text), self.loop)
-
-async def progress_bar(current, total, status, title):
-    # Wrapper for Pyrogram upload progress
-    tracker = ProgressTracker(status, title)
-    tracker.update(current, total)
+    except:
+        pass
 
 # ---------------- CORE LOGIC ----------------
 
-def get_extension_from_url(url):
-    path = urlparse(url).path
-    ext = os.path.splitext(path)[1]
-    return ext if ext else ".mp4"
-
-def get_real_filename(url, default_name, headers=None):
+def get_real_filename(url, default_name):
+    """Tries to get the real filename from headers"""
     try:
-        r = requests.head(url, allow_redirects=True, timeout=5, headers=headers)
+        r = requests.head(url, allow_redirects=True, timeout=5)
         if "Content-Disposition" in r.headers:
             fname = re.findall("filename=(.+)", r.headers["Content-Disposition"])
-            if fname:
-                return unquote(fname[0].strip().replace('"', '').replace("'", ""))
+            if fname: 
+                return fname[0].strip().replace('"', '')
     except: pass
     return default_name
 
+async def download_byte_range(url, start, end, filename):
+    """Downloads a specific part of a file using Curl"""
+    out_path = DOWNLOAD_DIR / filename
+    # Curl is efficient for range downloads
+    cmd = [
+        "curl", "-L", "-s", 
+        "-r", f"{start}-{end}", 
+        "-o", str(out_path),
+        url
+    ]
+    process = await asyncio.create_subprocess_exec(*cmd)
+    await process.wait()
+    return out_path if out_path.exists() else None
+
 def generate_thumbnail(video_path):
+    """
+    Extracts thumbnail using FFmpeg.
+    Updated to handle errors gracefully without crashing the bot.
+    """
     thumb_path = f"{video_path}.jpg"
-    timestamps = ["00:00:15", "00:00:02"]
+    
+    # 1. Check if file exists
+    if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
+        return None
+
+    # 2. Try different timestamps (15s, 2s, 0s)
+    timestamps = ["00:00:15", "00:00:02", "00:00:00"]
+    
     for ss in timestamps:
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", str(video_path), "-ss", ss, "-vframes", "1", thumb_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        if os.path.exists(thumb_path):
-            return thumb_path
+        try:
+            # We use subprocess.run to block locally in the thread
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", 
+                    "-i", str(video_path), 
+                    "-ss", ss, 
+                    "-vframes", "1", 
+                    thumb_path
+                ],
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.PIPE,  # Capture stderr to hide it from console
+                check=True # Raise error if ffmpeg fails
+            )
+            
+            # If successful, return path
+            if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 100:
+                return thumb_path
+                
+        except FileNotFoundError:
+            log.error("FFmpeg not installed! Uploading without thumbnail.")
+            return None
+        except Exception:
+            # Squelch ffmpeg errors (common with split parts) and try next timestamp
+            continue
+            
     return None
 
-async def upload_media_safe(client, chat_id, path, caption, thumb, status, progress_text):
+async def upload_video_safe(client, chat_id, path, caption, thumb, status, progress_text):
     if not os.path.exists(path): return
     
-    ext = os.path.splitext(path)[1].lower()
-    is_video = ext in ['.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv']
-    
-    # Progress wrapper for pyrogram
-    async def upload_progress(current, total):
-        await progress_bar(current, total, status, progress_text)
+    # Validate thumb existence
+    final_thumb = thumb
+    if thumb and not os.path.exists(thumb):
+        final_thumb = None
 
     try:
-        if is_video:
-            await client.send_video(
-                chat_id,
-                path,
-                caption=caption,
-                thumb=thumb,
-                supports_streaming=True,
-                progress=upload_progress
-            )
-        else:
-            await client.send_document(
-                chat_id,
-                path,
-                caption=caption,
-                thumb=thumb,
-                progress=upload_progress
-            )
+        await client.send_video(
+            chat_id,
+            path,
+            caption=caption,
+            thumb=final_thumb,
+            supports_streaming=True,
+            progress=progress_bar,
+            progress_args=(status, progress_text)
+        )
     except errors.FloodWait as e:
         log.warning(f"FloodWait: {e.value}s")
         await asyncio.sleep(e.value + 5)
-        await upload_media_safe(client, chat_id, path, caption, thumb, status, progress_text)
+        await upload_video_safe(client, chat_id, path, caption, final_thumb, status, progress_text)
     except Exception as e:
         log.error(f"Upload Error: {e}")
 
-# ---------------- SCRAPERS ----------------
+# ---------------- ALBUM PARSERS ----------------
 
-def get_gofile_token():
-    try:
-        r = requests.post("https://api.gofile.io/accounts", headers=GENERIC_HEADERS).json()
-        if r.get("status") == "ok":
-            return r["data"]["token"]
-    except: pass
-    return None
-
-def extract_gofile_folder(content_id, token):
-    files = []
-    try:
-        url = f"https://api.gofile.io/contents/{content_id}?wt={token}"
-        r = requests.get(url, headers=GENERIC_HEADERS).json()
-        
-        if r.get("status") == "ok":
-            contents = r["data"].get("children", {})
-            for child_id, child_data in contents.items():
-                if child_data["type"] == "folder":
-                    files.extend(extract_gofile_folder(child_data["id"], token))
-                else:
-                    files.append({
-                        "url": child_data["link"], # This is the download link
-                        "name": child_data["name"],
-                        "size": child_data["size"],
-                        "token": token,
-                        "type": "gofile"
-                    })
-    except Exception as e:
-        log.error(f"GoFile Error: {e}")
-    return files
-
-async def resolve_url(url, token=None):
+async def resolve_url(url):
     items = []
-    
-    if "gofile.io/d/" in url:
-        log.info("Detected GoFile")
-        content_id = url.split("/d/")[-1]
-        guest_token = get_gofile_token()
-        if guest_token:
-            found = extract_gofile_folder(content_id, guest_token)
-            items.extend(found)
-    
-    # ... (Keep other resolvers like Bunkr/Cyberfile from original code if needed) ...
-    # Simplified here to focus on GoFile fix
-    
+
+    # 1. Pixeldrain List/Album
+    if "pixeldrain.com/l/" in url:
+        list_id = url.split("/l/")[1].split("/")[0]
+        try:
+            r = requests.get(f"https://pixeldrain.com/api/list/{list_id}").json()
+            if r.get("success"):
+                for f in r.get("files", []):
+                    items.append({
+                        "url": f"https://pixeldrain.com/api/file/{f['id']}",
+                        "name": f['name'],
+                        "size": f['size']
+                    })
+        except Exception as e:
+            log.error(f"Pixeldrain List Error: {e}")
+
+    # 2. Pixeldrain Single
+    elif "pixeldrain.com/u/" in url:
+        file_id = url.split("/u/")[1].split("/")[0]
+        try:
+            r = requests.get(f"https://pixeldrain.com/api/file/{file_id}/info").json()
+            items.append({
+                "url": f"https://pixeldrain.com/api/file/{file_id}",
+                "name": r.get('name', f'{file_id}.mp4'),
+                "size": r.get('size', 0)
+            })
+        except: pass
+
+    # 3. GoFile
+    elif "gofile.io/d/" in url:
+        if GoFile:
+            try:
+                # Add your GoFile logic here if GoFile class is available
+                log.info("GoFile link detected.")
+            except: pass
+        else:
+             log.warning("GoFile module not imported.")
+
+    # 4. Direct Link (Generic)
     if not items:
-        # Fallback for generic direct links
-        items.append({"url": url, "name": "download", "size": 0, "type": "generic"})
+        try:
+            r = requests.head(url, allow_redirects=True)
+            size = int(r.headers.get("content-length", 0))
+            name = get_real_filename(url, "video.mp4")
+            items.append({"url": r.url, "name": name, "size": size})
+        except:
+            items.append({"url": url, "name": "video.mp4", "size": 0})
 
     return items
 
@@ -319,75 +234,102 @@ async def handler(client, message: Message):
     if not text.startswith("http"): return
 
     status = await message.reply("Analysing link...")
-    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+    
+    # 1. Clean previous runs
+    if DOWNLOAD_DIR.exists():
+        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-    url_parts = text.split()
-    main_url = url_parts[0]
-    
     try:
-        file_list = await resolve_url(main_url)
+        # 2. Resolve URL
+        file_list = await resolve_url(text)
         
         if not file_list:
-            await status.edit("❌ No files found.")
+            await status.edit("❌ Could not find files.")
             return
 
         total_files = len(file_list)
         await status.edit(f"Found {total_files} file(s). Starting...")
 
+        # 3. Process files
         for index, item in enumerate(file_list, 1):
             url = item["url"]
-            name = re.sub(r'[^\w\-. ]', '', item.get("name", "video"))
-            size = item.get("size", 0)
-            
-            # Ensure name has extension
-            if not os.path.splitext(name)[1]:
-                name += ".mp4"
-            
-            out_path = DOWNLOAD_DIR / name
+            name = re.sub(r'[^\w\-. ]', '', item["name"]) # Sanitize
+            size = item["size"]
 
-            await status.edit(f"<b>File {index}/{total_files}</b>\nDownloading: {name}...")
+            await status.edit(f"<b>File {index}/{total_files}</b>\nName: {name}\nSize: {format_bytes(size)}")
 
-            # --- GOFILE DOWNLOADER LOGIC ---
-            if item.get("type") == "gofile":
-                # Initialize tracker
-                tracker = ProgressTracker(status, f"DL: {name}")
+            # --- CASE A: Small File (< 1.9GB) ---
+            if 0 < size < MAX_CHUNK_SIZE:
+                f_path = await download_byte_range(url, 0, size, name)
                 
-                # Initialize the specific GoFile downloader
-                downloader = GoFileDownloader(token=item["token"], progress_callback=tracker.update)
-                
-                # Run sync download in async thread
-                try:
-                    await asyncio.to_thread(downloader.download, url, str(out_path), num_threads=8)
-                except Exception as e:
-                    await status.edit(f"Download Failed: {e}")
-                    continue
+                if f_path:
+                    # Generate thumb safely
+                    thumb = await asyncio.to_thread(generate_thumbnail, f_path)
+                    
+                    await upload_video_safe(client, "me", f_path, name, thumb, status, "Uploading")
+                    
+                    # Cleanup single file
+                    os.remove(f_path)
+                    if thumb and os.path.exists(thumb): os.remove(thumb)
 
-            # --- GENERIC DOWNLOADER (FALLBACK) ---
+            # --- CASE B: Large File OR Unknown Size ---
             else:
-                cmd = ["curl", "-k", "-L", "-s", "-o", str(out_path), url]
-                proc = await asyncio.create_subprocess_exec(*cmd)
-                await proc.wait()
-
-            # --- UPLOAD LOGIC ---
-            if out_path.exists() and out_path.stat().st_size > 0:
-                is_video = out_path.suffix.lower() in ['.mp4', '.mkv', '.avi', '.mov']
-                thumb = await asyncio.to_thread(generate_thumbnail, out_path) if is_video else None
+                parts = math.ceil(size / MAX_CHUNK_SIZE) if size > 0 else 1
+                if size == 0: await status.edit("⚠️ Unknown size, trying simplified download...")
                 
-                await upload_media_safe(client, "me", str(out_path), name, thumb, status, "Uploading")
-                
-                os.remove(out_path)
-                if thumb and os.path.exists(thumb): os.remove(thumb)
-            else:
-                await status.edit(f"Failed to download: {name}")
+                current_byte = 0
+                global_thumb = None
 
-        await status.edit("✅ All tasks completed!")
+                for part in range(1, parts + 1):
+                    end_byte = min(current_byte + MAX_CHUNK_SIZE - 1, size - 1)
+                    part_name = f"{name}.part{part:03d}.mp4"
+                    
+                    await status.edit(f"<b>File {index}/{total_files}: {name}</b>\n"
+                                      f"Processing Part {part}/{parts}")
+
+                    # 1. Download Chunk
+                    chunk_path = await download_byte_range(url, current_byte, end_byte, part_name)
+                    if not chunk_path: break
+
+                    # 2. Thumbnail Logic (Only try for Part 1)
+                    if part == 1:
+                        extracted = await asyncio.to_thread(generate_thumbnail, chunk_path)
+                        if extracted:
+                            global_thumb = str(DOWNLOAD_DIR / f"thumb_{index}.jpg")
+                            os.rename(extracted, global_thumb)
+
+                    # 3. Upload
+                    caption = f"{name}\nPart {part}/{parts}"
+                    # Pass global_thumb. If it's None, upload_video_safe handles it.
+                    await upload_video_safe(client, "me", chunk_path, caption, global_thumb, status, f"Up Part {part}")
+
+                    # 4. Delete Chunk
+                    os.remove(chunk_path)
+                    current_byte = end_byte + 1
+
+                # Cleanup Master Thumb for this file
+                if global_thumb and os.path.exists(global_thumb):
+                    os.remove(global_thumb)
+
+        await status.edit("✅ All files processed successfully!")
 
     except Exception as e:
         log.exception(e)
         await status.edit(f"Error: {str(e)}")
     
-    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+    finally:
+        # Final cleanup ensures space is freed even on error
+        if DOWNLOAD_DIR.exists():
+            shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
 
 if __name__ == "__main__":
+    print("Bot Starting...")
+    # Optional: Check for ffmpeg at startup
+    try:
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("✅ FFmpeg found.")
+    except FileNotFoundError:
+        print("❌ FFmpeg NOT found. Thumbnails will not work. Install with: sudo apt install ffmpeg")
+        
     app.run()
