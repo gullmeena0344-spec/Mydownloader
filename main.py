@@ -104,26 +104,48 @@ def get_duration(file_path):
 
 def faststart_mp4(src):
     if not os.path.exists(src):
+        log.warning(f"faststart: Source file not found: {src}")
         return src
+
     dst = src + ".fast.mp4"
     try:
-        subprocess.run(
+        log.info(f"Adding faststart to {os.path.basename(src)}")
+        result = subprocess.run(
             ["ffmpeg", "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", dst],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=300,
+            text=True
         )
-        return dst if os.path.exists(dst) else src
-    except:
+
+        if result.returncode == 0 and os.path.exists(dst):
+            log.info(f"Faststart successful: {os.path.basename(dst)}")
+            return dst
+        else:
+            log.warning(f"Faststart failed, using original file: {result.stderr[:200] if result.stderr else 'Unknown error'}")
+            return src
+    except subprocess.TimeoutExpired:
+        log.error(f"Faststart timeout for {os.path.basename(src)}")
+        return src
+    except Exception as e:
+        log.error(f"Faststart error: {e}")
         return src
 
 def generate_thumbnail(video_path):
     video_path = str(video_path)
     thumb_path = f"{video_path}.jpg"
+
     if not os.path.exists(video_path):
+        log.error(f"Video file not found for thumbnail: {video_path}")
+        return None
+
+    file_size = os.path.getsize(video_path)
+    if file_size < 1024:
+        log.error(f"Video file too small for thumbnail: {file_size} bytes")
         return None
 
     duration = get_duration(video_path)
+    log.info(f"Generating thumbnail for {os.path.basename(video_path)} (duration: {duration}s, size: {format_bytes(file_size)})")
 
     timestamps = []
     if duration > 0:
@@ -131,19 +153,37 @@ def generate_thumbnail(video_path):
         timestamps.append(f"{duration * 0.50:.2f}")
         timestamps.append("2")
     else:
-        timestamps = ["00:00:02", "00:00:00"]
+        timestamps = ["2", "1", "0"]
 
     for ss in timestamps:
         try:
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", str(video_path), "-ss", str(ss), "-vframes", "1", thumb_path],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-ss", str(ss), "-i", str(video_path), "-vframes", "1",
+                 "-q:v", "2", "-vf", "scale=320:-1", thumb_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+                text=True
             )
-            if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 1024:
-                return thumb_path
-        except:
+
+            if result.returncode == 0 and os.path.exists(thumb_path):
+                thumb_size = os.path.getsize(thumb_path)
+                if thumb_size > 1024:
+                    log.info(f"Thumbnail generated: {thumb_path} ({format_bytes(thumb_size)})")
+                    return thumb_path
+                else:
+                    log.warning(f"Thumbnail too small at timestamp {ss}s: {thumb_size} bytes")
+            else:
+                stderr_msg = result.stderr[:300] if result.stderr else "No error output"
+                log.warning(f"FFmpeg failed at timestamp {ss}s: {stderr_msg}")
+
+        except subprocess.TimeoutExpired:
+            log.error(f"FFmpeg timeout at timestamp {ss}s")
+        except Exception as e:
+            log.error(f"Exception generating thumbnail at {ss}s: {e}")
             continue
 
+    log.error(f"Failed to generate thumbnail for {os.path.basename(video_path)}")
     return None
 
 async def handle_gofile_logic(client, message, status, url):
