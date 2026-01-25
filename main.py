@@ -255,7 +255,6 @@ async def handle_gofile_logic(client, message, status, url):
         log.exception(e)
         await status.edit(f"GoFile Error: {str(e)}")
 
-
 async def download_direct_any(url, out_path, status):
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -458,7 +457,6 @@ async def handle_generic_logic(client, message, status, url):
                 os.remove(part)
 
     await status.edit("Done!")
-
 
 @app.on_message(filters.text & (filters.outgoing | filters.private))
 async def handler(client, message: Message):
