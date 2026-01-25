@@ -37,6 +37,16 @@ app = Client(
     session_string=SESSION_STRING
 )
 
+saved_messages_chat = None
+
+async def get_saved_messages_chat(client):
+    global saved_messages_chat
+    if not saved_messages_chat:
+        me = await client.get_me()
+        saved_messages_chat = me.id
+        log.info(f"Saved Messages chat ID: {saved_messages_chat}")
+    return saved_messages_chat
+
 def get_free_space():
     return shutil.disk_usage(os.getcwd()).free
 
@@ -208,8 +218,9 @@ async def handle_gofile_logic(client, message, status, url):
                             thumb_path = await asyncio.to_thread(generate_thumbnail, fixed_path)
 
                             try:
+                                chat_id = await get_saved_messages_chat(client)
                                 await client.send_video(
-                                    "me",
+                                    chat_id,
                                     video=fixed_path,
                                     caption=caption,
                                     supports_streaming=True,
@@ -354,8 +365,9 @@ async def handle_generic_logic(client, message, status, url):
         if size <= MAX_CHUNK_SIZE:
             thumb = await asyncio.to_thread(generate_thumbnail, str(path))
             try:
+                chat_id = await get_saved_messages_chat(client)
                 await client.send_video(
-                    "me",
+                    chat_id,
                     str(path),
                     caption=name,
                     thumb=thumb,
@@ -426,8 +438,9 @@ async def handle_generic_logic(client, message, status, url):
             thumb = await asyncio.to_thread(generate_thumbnail, str(part))
 
             try:
+                chat_id = await get_saved_messages_chat(client)
                 await client.send_video(
-                    "me",
+                    chat_id,
                     str(part),
                     caption=part_name,
                     thumb=thumb,
