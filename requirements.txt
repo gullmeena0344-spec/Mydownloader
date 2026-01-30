@@ -1,5 +1,5 @@
 certifi
-charset-normalizer
+charset
 idna
 pathvalidate
 requests
@@ -9,6 +9,7 @@ pyrogram
 tgcrypto
 yt-dlp
 aiohttp
-beautifulsoup4
-aiofiles
-pathvalidate
+tenacity
+bs4
+BeautifulSoup
+cloudscraper
